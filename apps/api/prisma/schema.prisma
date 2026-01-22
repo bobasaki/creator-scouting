@@ -1,0 +1,49 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Run {
+  id                 String     @id
+  createdAt          DateTime   @default(now())
+
+  // input params
+  region             String
+  language           String
+  keywords           Json
+
+  maxChannels        Int?
+  videosToAnalyze    Int?
+
+  minAvgViews        Int?
+  maxDaysSinceUpload Int?
+  minSubscribers     Int?
+
+  results            RunResult[]
+
+  @@index([createdAt])
+}
+
+model RunResult {
+  id                String   @id @default(uuid())
+  runId             String
+  run               Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  channelId          String
+  channelName        String
+  channelUrl         String
+
+  subscriberCount    Int
+  avgViewsLastN      Int
+  daysSinceLastUpload Int
+  recentViews        Json
+
+  scores             Json
+  finalScore         Int
+
+  @@index([runId])
+  @@index([finalScore])
+}

@@ -1,17 +1,22 @@
+import { createRunWithResults, getRunById } from "../repositories/runs.repo";
+import { FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
+
+import { RunRequestSchema } from "../schemas/run.schema";
+
+import { scoreChannel } from "../domain/score";
+import { passesFilters } from "../domain/filter";
+import { ChannelMetrics } from "../domain/types";
+
 import {
   searchChannelsByKeyword,
   getChannelDetails,
   getRecentVideos
 } from "../integrations/youtube/client";
 import { mapYoutubeToChannelMetrics } from "../integrations/youtube/mapper";
-import { FastifyInstance } from "fastify";
-import { RunRequestSchema } from "../schemas/run.schema";
-import { scoreChannel } from "../domain/score";
-import { passesFilters } from "../domain/filter";
-import { ChannelMetrics } from "../domain/types";
 
 export async function runsRoutes(app: FastifyInstance) {
+  // POST /api/runs
   app.post("/api/runs", async (request, reply) => {
     const parseResult = RunRequestSchema.safeParse(request.body);
 
@@ -23,6 +28,7 @@ export async function runsRoutes(app: FastifyInstance) {
     }
 
     const validatedInput = parseResult.data;
+
     try {
       const {
         keywords,
@@ -57,11 +63,11 @@ export async function runsRoutes(app: FastifyInstance) {
         safeMaxChannels
       );
 
-      // 3) Fetch channel details (subscriber counts, name if available)
+      // 3) Fetch channel details
       const details = await getChannelDetails(uniqueChannelIds);
 
       // 4) Fetch recent videos per channel, normalize, filter, score
-      const results = [];
+      const results: any[] = [];
       for (const ch of details as any[]) {
         const channelId = ch.channelId;
 
@@ -89,11 +95,21 @@ export async function runsRoutes(app: FastifyInstance) {
 
       results.sort((a: any, b: any) => b.finalScore - a.finalScore);
 
+      const runId = randomUUID();
+      const createdAt = new Date().toISOString();
+
+      await createRunWithResults({
+        runId,
+        input: validatedInput as any,
+        results
+      });
+
       return {
-        run_id: randomUUID(),
-        created_at: new Date().toISOString(),
+        run_id: runId,
+        created_at: createdAt,
         results
       };
+      
     } catch (err: any) {
       request.log.error({ err }, "POST /api/runs failed");
       return reply.status(500).send({
@@ -103,6 +119,7 @@ export async function runsRoutes(app: FastifyInstance) {
     }
   });
 
+  // GET /api/runs/:runId (mocked retrieval until DB step)
   app.get("/api/runs/:runId", async () => {
     const mockChannel: ChannelMetrics = {
       channelId: "UCxxxx",
@@ -136,18 +153,45 @@ export async function runsRoutes(app: FastifyInstance) {
     };
   });
 
+  // GET /api/runs/:runId/export (mocked)
   app.get("/api/runs/:runId/export", async (request, reply) => {
-    const { format } = request.query as { format?: string };
+  const { runId } = request.params as { runId: string };
+  const { format } = request.query as { format?: string };
 
-    if (format === "csv") {
-      reply.header("Content-Type", "text/csv");
-      reply.send("channel_name,final_score\nExample Channel,83");
-      return;
-    }
+  const found = await getRunById(runId);
+  if (!found) return reply.status(404).send({ error: "Run not found" });
 
-    return {
-      message: "Export format not implemented yet",
-      available_formats: ["csv", "json"]
-    };
-  });
+  const results = found.results;
+
+  if (format === "csv") {
+    reply.header("Content-Type", "text/csv");
+
+    const header =
+      "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score\n";
+
+    const rows = results
+      .map((r: any) => {
+        // minimal CSV escaping for commas/quotes
+        const esc = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+        return [
+          esc(r.channelId),
+          esc(r.channelName),
+          esc(r.channelUrl),
+          r.subscriberCount ?? 0,
+          r.avgViewsLastN ?? 0,
+          r.daysSinceLastUpload ?? 0,
+          r.finalScore ?? 0
+        ].join(",");
+      })
+      .join("\n");
+
+    reply.send(header + rows + "\n");
+    return;
+  }
+
+  return {
+    message: "Export format not implemented yet",
+    available_formats: ["csv", "json"]
+  };
+});
 }
