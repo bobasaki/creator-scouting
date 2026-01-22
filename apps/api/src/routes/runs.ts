@@ -1,16 +1,29 @@
 import { FastifyInstance } from "fastify";
+import { RunRequestSchema } from "../schemas/run.schema";
 
 export async function runsRoutes(app: FastifyInstance) {
-  // POST /api/runs
   app.post("/api/runs", async (request, reply) => {
+    reply.header("X-Validation-Handler", "active");
+    const parseResult = RunRequestSchema.safeParse(request.body);
+
+    if (!parseResult.success) {
+      return reply.status(400).send({
+        error: "Invalid request",
+        details: parseResult.error.format()
+      });
+    }
+
+    const validatedInput = parseResult.data;
+
+    // Placeholder: logic will be added later
     return {
       run_id: "mock-run-id",
-      status: "completed"
+      status: "completed",
+      input: validatedInput
     };
   });
 
-  // GET /api/runs/:runId
-  app.get("/api/runs/:runId", async (request, reply) => {
+  app.get("/api/runs/:runId", async () => {
     return {
       run_id: "mock-run-id",
       created_at: new Date().toISOString(),
@@ -19,38 +32,16 @@ export async function runsRoutes(app: FastifyInstance) {
         region: "DE",
         language: "de"
       },
-      results: [
-        {
-          channel_id: "UCxxxx",
-          channel_name: "Example Channel",
-          channel_url: "https://youtube.com/channel/UCxxxx",
-          metrics: {
-            subscriber_count: 120000,
-            avg_views_last_n: 15400,
-            days_since_last_upload: 4
-          },
-          scores: {
-            activity_score: 25,
-            performance_score: 22,
-            consistency_score: 18,
-            audience_size_score: 10,
-            niche_relevance_score: 8
-          },
-          final_score: 83
-        }
-      ]
+      results: []
     };
   });
 
-  // GET /api/runs/:runId/export
   app.get("/api/runs/:runId/export", async (request, reply) => {
     const { format } = request.query as { format?: string };
 
     if (format === "csv") {
       reply.header("Content-Type", "text/csv");
-      reply.send(
-        "channel_name,final_score\nExample Channel,83"
-      );
+      reply.send("channel_name,final_score\nExample Channel,83");
       return;
     }
 
