@@ -180,3 +180,53 @@ export async function getRecentVideos(
 
   return { views, daysSinceLastUpload };
 }
+
+// Move these types and function to top-level scope
+
+type YouTubeChannelSnippetItem = {
+  id: string;
+  snippet?: { description?: string };
+};
+
+type YouTubeSearchVideoSnippetItem = {
+  id?: { videoId?: string };
+  snippet?: { title?: string };
+};
+
+export async function getChannelText(
+  channelId: string,
+  maxTitles = 5
+): Promise<{ description: string; recentTitles: string[] }> {
+  const key = requireApiKey();
+  const safeMax = Math.max(1, Math.min(maxTitles, 10));
+
+  // 1) Fetch channel description
+  const channelUrl = buildUrl("https://www.googleapis.com/youtube/v3/channels", {
+    key,
+    part: "snippet",
+    id: channelId
+  });
+
+  const channelJson = await fetchJson<{ items?: YouTubeChannelSnippetItem[] }>(channelUrl);
+  const description =
+    channelJson.items?.[0]?.snippet?.description?.trim() ?? "";
+
+  // 2) Fetch recent video titles
+  const searchUrl = buildUrl("https://www.googleapis.com/youtube/v3/search", {
+    key,
+    part: "snippet",
+    channelId,
+    order: "date",
+    type: "video",
+    maxResults: safeMax
+  });
+
+  const searchJson = await fetchJson<{ items?: YouTubeSearchVideoSnippetItem[] }>(searchUrl);
+
+  const recentTitles =
+    searchJson.items
+      ?.map((it) => it.snippet?.title?.trim())
+      .filter((t): t is string => Boolean(t)) ?? [];
+
+  return { description, recentTitles };
+}

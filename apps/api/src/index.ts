@@ -1,3 +1,9 @@
+import path from "node:path";
+import dotenv from "dotenv";
+
+// index.ts is in apps/api/src, so .env is at apps/api/.env
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
+
 import { buildServer } from "./server";
 
 const server = buildServer();

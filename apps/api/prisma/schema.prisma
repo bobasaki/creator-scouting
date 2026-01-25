@@ -47,3 +47,23 @@ model RunResult {
   @@index([runId])
   @@index([finalScore])
 }
+
+model RunResultEnrichment {
+  id               String   @id @default(uuid())
+  runId            String
+  channelId         String
+
+  model            String?
+  status           String   @default("pending")
+  createdAt        DateTime @default(now())
+
+  nicheLabels       Json?
+  languageDetected  String?
+  fitSummary        String?
+  brandSafetyNotes  String?
+  redFlags          Json?
+  raw              Json?
+
+  @@index([runId])
+  @@unique([runId, channelId])
+}
