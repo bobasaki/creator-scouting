@@ -26,6 +26,11 @@ import { enrichChannel } from "../integrations/llm/openai";
 import { createRunWithResults, getRunById } from "../repositories/runs.repo";
 
 export async function runsRoutes(app: FastifyInstance) {
+  // DEBUG: confirms which runs.ts is currently running
+  app.get("/debug/version", async () => {
+    return { runs_ts: "10.1-idempotency", ts: new Date().toISOString() };
+  });
+
   // POST /runs (real execution + persistence)
   app.post("/runs", async (request, reply) => {
     const parseResult = RunRequestSchema.safeParse(request.body);
@@ -257,8 +262,11 @@ export async function runsRoutes(app: FastifyInstance) {
   });
 
   // POST /runs/:runId/enrich
+  // Step 10.1: Idempotent by default (skip already-success rows)
   app.post("/runs/:runId/enrich", async (request, reply) => {
     const { runId } = request.params as { runId: string };
+    const { force } = request.query as { force?: string };
+    const forceEnrich = force === "true" || force === "1";
 
     const found = await getRunById(runId);
     if (!found) {
@@ -275,9 +283,32 @@ export async function runsRoutes(app: FastifyInstance) {
 
     let successCount = 0;
     let failureCount = 0;
+    let skippedCount = 0;
+
+    // Prefetch existing enrichments for this run (idempotency)
+    const existingRows = await getEnrichmentsForRun(runId);
+    const existingByChannelId = new Map<string, any>();
+    for (const row of existingRows as any[]) {
+      if (row?.channelId) existingByChannelId.set(row.channelId, row);
+    }
+    request.log.info(
+      {
+        runId,
+        forceEnrich,
+        existingRows: (existingRows as any[]).length,
+        existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
+      },
+      "ENRICH v10.1 idempotency precheck"
+    );
 
     for (const r of found.results) {
       const channelId = r.channelId;
+
+      const existing = existingByChannelId.get(channelId);
+      if (!forceEnrich && existing?.status === "success") {
+        skippedCount++;
+        continue;
+      }
 
       try {
         // 1) Mark pending
@@ -346,10 +377,13 @@ Classify this channel for influencer scouting.
     }
 
     return {
+      version: "10.1-idempotency",
       run_id: runId,
       enriched: successCount,
+      skipped: skippedCount,
       failed: failureCount,
-      total: found.results.length
+      total: found.results.length,
+      forced: forceEnrich
     };
   });
 }
