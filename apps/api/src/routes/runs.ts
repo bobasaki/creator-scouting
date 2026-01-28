@@ -334,6 +334,46 @@ export async function runsRoutes(app: FastifyInstance) {
     };
   });
 
+    // GET /runs/:runId/enrich/status
+  // Step 10.3: Cheap progress endpoint (DB-only)
+  app.get("/runs/:runId/enrich/status", async (request, reply) => {
+    const { runId } = request.params as { runId: string };
+
+    const found = await getRunById(runId);
+    if (!found) {
+      return reply.status(404).send({ error: "Run not found" });
+    }
+
+    const total = found.results.length;
+
+    const enrichments = await getEnrichmentsForRun(runId);
+
+    let success = 0;
+    let failed = 0;
+    let pending = 0;
+    let other = 0;
+
+    for (const e of enrichments as any[]) {
+      const s = String((e as any).status ?? "").toLowerCase();
+      if (s === "success") success++;
+      else if (s === "failed") failed++;
+      else if (s === "pending") pending++;
+      else other++;
+    }
+
+    const missing = Math.max(0, total - (success + failed + pending + other));
+
+    return {
+      version: "10.3-status",
+      run_id: runId,
+      total,
+      success,
+      failed,
+      pending,
+      other,
+      missing
+    };
+  });
   // POST /runs/:runId/enrich
   // Step 10.2: Concurrency + retries, while keeping 10.1 idempotency (skip success unless forced)
   app.post("/runs/:runId/enrich", async (request, reply) => {
