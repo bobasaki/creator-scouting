@@ -106,9 +106,49 @@ type EnrichJobState = {
   forced?: boolean;
   concurrency?: number;
   lastError?: string | null;
+
+  // Step 10.6: job summary (in-memory)
+  total?: number;
+  toProcess?: number;
+  enriched?: number;
+  skipped?: number;
+  failed?: number;
 };
 
 const enrichJobs = new Map<string, EnrichJobState>();
+const enrichJobTimers = new Map<string, NodeJS.Timeout>();
+
+// Step 10.8: cleanup timers to prevent memory growth
+const enrichJobCleanupTimers = new Map<string, NodeJS.Timeout>();
+
+function clearJobTimers(runId: string) {
+  const t = enrichJobTimers.get(runId);
+  if (t) clearTimeout(t);
+  enrichJobTimers.delete(runId);
+
+  const c = enrichJobCleanupTimers.get(runId);
+  if (c) clearTimeout(c);
+  enrichJobCleanupTimers.delete(runId);
+}
+
+function scheduleJobCleanup(runId: string, log?: any) {
+  // Default: 10 minutes; cap between 10s and 24h
+  const ttlMs = Math.max(
+    10_000,
+    Math.min(Number(process.env.ENRICH_JOB_TTL_MS ?? 600_000), 24 * 60 * 60 * 1000)
+  );
+
+  const existing = enrichJobCleanupTimers.get(runId);
+  if (existing) clearTimeout(existing);
+
+  const handle = setTimeout(() => {
+    enrichJobs.delete(runId);
+    enrichJobCleanupTimers.delete(runId);
+    log?.info?.({ runId, ttlMs }, "ENRICH v10.8 cleaned up job state");
+  }, ttlMs);
+
+  enrichJobCleanupTimers.set(runId, handle);
+}
 
 async function runEnrichmentJob(args: {
   runId: string;
@@ -157,15 +197,24 @@ async function runEnrichmentJob(args: {
       existingRows: (existingRows as any[]).length,
       existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
     },
-    "ENRICH v10.4 async job precheck"
+    "ENRICH v10.7 claim precheck"
   );
 
   const outcomes = await runPool(toProcess, concurrency, async (r) => {
+    // Step 10.5: stop quickly if job has been marked failed/done (e.g., timeout)
+    const jobState = enrichJobs.get(runId);
+    if (jobState?.status !== "running") {
+      return "failed" as const;
+    }
+
     const channelId = r.channelId;
 
     try {
-      // 1) Mark pending
-      await markPending({ runId, channelId });
+      // 1) Claim pending (Step 10.7: prevent duplicate spend)
+      const claim = await markPending({ runId, channelId });
+      if (!claim.claimed) {
+        return "skipped" as const;
+      }
 
       // 2) Fetch YouTube text
       const { description, recentTitles } = await getChannelText(channelId, 5);
@@ -235,10 +284,11 @@ Classify this channel for influencer scouting.
 
   const successCount = outcomes.filter((o) => o === "success").length;
   const failureCount = outcomes.filter((o) => o === "failed").length;
+  const claimedSkipCount = outcomes.filter((o) => o === "skipped").length;
 
   return {
     enriched: successCount,
-    skipped: skippedCount,
+    skipped: skippedCount + claimedSkipCount,
     failed: failureCount,
     total: found.results.length
   };
@@ -247,15 +297,51 @@ Classify this channel for influencer scouting.
 export async function runsRoutes(app: FastifyInstance) {
   // DEBUG: confirms which runs.ts is currently running
   app.get("/debug/version", async () => {
-    return { runs_ts: "10.2-concurrency", ts: new Date().toISOString() };
+    return { runs_ts: "10.8-cleanup", ts: new Date().toISOString() };
   });
 
   // GET /runs/:runId/enrich/job
-  // Step 10.4: in-memory job state (resets on server restart)
-  app.get("/runs/:runId/enrich/job", async (request) => {
+  // Step 10.6: in-memory job state + optional DB-backed progress
+  app.get("/runs/:runId/enrich/job", async (request, reply) => {
     const { runId } = request.params as { runId: string };
-    const state = enrichJobs.get(runId) ?? { status: "idle" };
-    return { version: "10.4-async", run_id: runId, job: state };
+    const { include } = request.query as { include?: string };
+
+    const job = enrichJobs.get(runId) ?? { status: "idle" };
+
+    // Optional: include DB-backed progress (cheap-ish, but deterministic)
+    if (include === "status") {
+      const found = await getRunById(runId);
+      if (!found) {
+        return reply.status(404).send({ error: "Run not found" });
+      }
+
+      const total = found.results.length;
+      const enrichments = await getEnrichmentsForRun(runId);
+
+      let success = 0;
+      let failed = 0;
+      let pending = 0;
+      let other = 0;
+
+      for (const e of enrichments as any[]) {
+        const s = String((e as any).status ?? "").toLowerCase();
+        if (s === "success") success++;
+        else if (s === "failed") failed++;
+        else if (s === "pending") pending++;
+        else other++;
+      }
+
+      const missing = Math.max(0, total - (success + failed + pending + other));
+
+      return {
+        version: "10.8-cleanup",
+        run_id: runId,
+        job,
+        status: { total, success, failed, pending, other, missing }
+      };
+    }
+
+    return { version: "10.8-cleanup", run_id: runId, job };
   });
 
   // POST /runs (real execution + persistence)
@@ -529,7 +615,7 @@ export async function runsRoutes(app: FastifyInstance) {
     };
   });
   // POST /runs/:runId/enrich
-  // Step 10.4: Non-blocking async job (in-process)
+  // Step 10.6: Non-blocking async job (in-process), expose summary fields and stable snapshot
   app.post("/runs/:runId/enrich", async (request, reply) => {
     const { runId } = request.params as { runId: string };
     const { force } = request.query as { force?: string };
@@ -540,6 +626,8 @@ export async function runsRoutes(app: FastifyInstance) {
     if (!found) {
       return reply.status(404).send({ error: "Run not found" });
     }
+
+    const total = found.results.length;
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -554,11 +642,17 @@ export async function runsRoutes(app: FastifyInstance) {
       Math.min(Number(process.env.ENRICH_CONCURRENCY ?? 3), 10)
     );
 
+    // Step 10.5: hard timeout guard (ms)
+    const jobTimeoutMs = Math.max(
+      10_000,
+      Math.min(Number(process.env.ENRICH_JOB_TIMEOUT_MS ?? 180_000), 30 * 60 * 1000)
+    );
+
     const existingJob = enrichJobs.get(runId);
     if (existingJob?.status === "running") {
       // Already running — return 202 with current job state
       return reply.status(202).send({
-        version: "10.4-async",
+        version: "10.8-cleanup",
         run_id: runId,
         accepted: false,
         reason: "already_running",
@@ -572,11 +666,35 @@ export async function runsRoutes(app: FastifyInstance) {
       startedAt,
       forced: forceEnrich,
       concurrency,
-      lastError: null
+      lastError: null,
+      total
     };
     enrichJobs.set(runId, jobState);
 
+    // Step 10.5/10.8: clear any previous timers (timeout + cleanup) for this run
+    clearJobTimers(runId);
+
     const log = request.log.child({ runId, forceEnrich, concurrency, job: "enrich" });
+
+    const timeoutHandle = setTimeout(() => {
+      const current = enrichJobs.get(runId);
+      if (current?.status === "running") {
+        enrichJobs.set(runId, {
+          status: "failed",
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          forced: forceEnrich,
+          concurrency,
+          lastError: `timeout after ${jobTimeoutMs}ms`,
+          total
+        });
+
+        // Step 10.8: cleanup failed job state after TTL
+        scheduleJobCleanup(runId, log);
+      }
+    }, jobTimeoutMs);
+
+    enrichJobTimers.set(runId, timeoutHandle);
 
     // Fire-and-forget execution (do not await)
     setImmediate(() => {
@@ -589,39 +707,52 @@ export async function runsRoutes(app: FastifyInstance) {
         log
       })
         .then((summary) => {
+          clearJobTimers(runId);
+
           enrichJobs.set(runId, {
             status: "done",
             startedAt,
             finishedAt: new Date().toISOString(),
             forced: forceEnrich,
             concurrency,
-            lastError: null
+            lastError: null,
+            total,
+            enriched: summary.enriched,
+            skipped: summary.skipped,
+            failed: summary.failed
           });
 
-          log.info({ summary }, "ENRICH v10.4 async job done");
+          scheduleJobCleanup(runId, log);
+
+          log.info({ summary }, "ENRICH v10.8 cleanup job done");
         })
         .catch((err: any) => {
+          clearJobTimers(runId);
+
           enrichJobs.set(runId, {
             status: "failed",
             startedAt,
             finishedAt: new Date().toISOString(),
             forced: forceEnrich,
             concurrency,
-            lastError: err?.message ?? "Unknown error"
+            lastError: err?.message ?? "Unknown error",
+            total
           });
 
-          log.error({ err }, "ENRICH v10.4 async job failed");
+          scheduleJobCleanup(runId, log);
+
+          log.error({ err }, "ENRICH v10.8 cleanup job failed");
         });
     });
 
     return reply.status(202).send({
-      version: "10.4-async",
+      version: "10.8-cleanup",
       run_id: runId,
       accepted: true,
-      job: enrichJobs.get(runId),
+      job: { ...jobState },
       next: {
         status: `/runs/${runId}/enrich/status`,
-        job: `/runs/${runId}/enrich/job`
+        job: `/runs/${runId}/enrich/job?include=status`
       }
     });
   });

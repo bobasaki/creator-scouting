@@ -17,14 +17,72 @@ export type EnrichmentPayload = {
   raw?: any;
 };
 
-export async function markPending(params: { runId: string; channelId: string }) {
-  const { runId, channelId } = params;
+export async function markPending(args: {
+  runId: string;
+  channelId: string;
+}): Promise<{ claimed: boolean }> {
+  const { runId, channelId } = args;
 
-  return prisma.runResultEnrichment.upsert({
-    where: { runId_channelId: { runId, channelId } },
-    update: { status: "pending" },
-    create: { runId, channelId, status: "pending" }
+  // 10.7: DB-level claim to prevent duplicate OpenAI spend.
+  // - If row exists AND is already pending: someone else is working -> NOT claimed.
+  // - If row exists AND is not pending: flip it to pending -> claimed.
+  // - If row doesn't exist: create pending -> claimed.
+  //
+  // Requires @@unique([runId, channelId]) in schema.
+
+  // 1) Try to update existing non-pending row to pending
+  const updated = await prisma.runResultEnrichment.updateMany({
+    where: { runId, channelId, NOT: { status: "pending" } },
+    data: {
+      status: "pending",
+      model: null,
+      nicheLabels: Prisma.DbNull,
+      languageDetected: null,
+      fitSummary: null,
+      brandSafetyNotes: null,
+      redFlags: Prisma.DbNull,
+      raw: Prisma.DbNull
+    }
   });
+
+  if (updated.count > 0) return { claimed: true };
+
+  // 2) If no update happened, check if row exists (likely pending)
+  const existing = await prisma.runResultEnrichment.findUnique({
+    where: { runId_channelId: { runId, channelId } }
+  });
+
+  if (existing) {
+    // status is pending (or row otherwise not updatable) => not claimed
+    return { claimed: false };
+  }
+
+  // 3) Create new pending row (race-safe due to unique constraint)
+  try {
+    await prisma.runResultEnrichment.create({
+      data: {
+        runId,
+        channelId,
+        status: "pending",
+        model: null,
+        nicheLabels: Prisma.DbNull,
+        languageDetected: null,
+        fitSummary: null,
+        brandSafetyNotes: null,
+        redFlags: Prisma.DbNull,
+        raw: Prisma.DbNull
+      }
+    });
+
+    return { claimed: true };
+  } catch (err: any) {
+    // If another worker created it concurrently, treat as not claimed
+    const msg = String(err?.message ?? "").toLowerCase();
+    if (msg.includes("unique") || msg.includes("constraint")) {
+      return { claimed: false };
+    }
+    throw err;
+  }
 }
 
 export async function saveSuccess(params: { runId: string; channelId: string; payload: EnrichmentPayload }) {
