@@ -25,10 +25,83 @@ import { enrichChannel } from "../integrations/llm/openai";
 
 import { createRunWithResults, getRunById } from "../repositories/runs.repo";
 
+/**
+ * 10.2 helpers: retry + concurrency pool
+ */
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRetryableError(err: any): boolean {
+  const msg = String(err?.message ?? "").toLowerCase();
+  return (
+    msg.includes("429") ||
+    msg.includes("rate limit") ||
+    msg.includes("http 5") ||
+    msg.includes("timeout") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("temporarily") ||
+    msg.includes("server error")
+  );
+}
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  opts: { retries: number; baseMs: number; maxMs: number }
+): Promise<T> {
+  let attempt = 0;
+  let lastErr: any;
+
+  while (attempt <= opts.retries) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastErr = err;
+
+      if (!isRetryableError(err) || attempt === opts.retries) {
+        throw err;
+      }
+
+      const jitter = Math.floor(Math.random() * 150);
+      const backoff = Math.min(opts.maxMs, opts.baseMs * 2 ** attempt) + jitter;
+      await sleep(backoff);
+      attempt++;
+    }
+  }
+
+  throw lastErr;
+}
+
+/**
+ * Runs async tasks with concurrency limit.
+ * Preserves completion (not input) ordering; OK for our counting use-case.
+ */
+async function runPool<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>
+): Promise<R[]> {
+  let idx = 0;
+  const results: R[] = new Array(items.length);
+
+  async function runner() {
+    while (true) {
+      const currentIndex = idx++;
+      if (currentIndex >= items.length) return;
+      results[currentIndex] = await worker(items[currentIndex]);
+    }
+  }
+
+  const n = Math.max(1, Math.min(concurrency, items.length || 1));
+  await Promise.all(Array.from({ length: n }, () => runner()));
+  return results;
+}
+
 export async function runsRoutes(app: FastifyInstance) {
   // DEBUG: confirms which runs.ts is currently running
   app.get("/debug/version", async () => {
-    return { runs_ts: "10.1-idempotency", ts: new Date().toISOString() };
+    return { runs_ts: "10.2-concurrency", ts: new Date().toISOString() };
   });
 
   // POST /runs (real execution + persistence)
@@ -262,7 +335,7 @@ export async function runsRoutes(app: FastifyInstance) {
   });
 
   // POST /runs/:runId/enrich
-  // Step 10.1: Idempotent by default (skip already-success rows)
+  // Step 10.2: Concurrency + retries, while keeping 10.1 idempotency (skip success unless forced)
   app.post("/runs/:runId/enrich", async (request, reply) => {
     const { runId } = request.params as { runId: string };
     const { force } = request.query as { force?: string };
@@ -274,12 +347,17 @@ export async function runsRoutes(app: FastifyInstance) {
     }
 
     const apiKey = process.env.OPENAI_API_KEY;
-
     if (!apiKey) {
       return reply.status(500).send({ error: "Missing OPENAI_API_KEY" });
     }
 
     const model = "gpt-5-nano";
+
+    // Concurrency config (start low)
+    const concurrency = Math.max(
+      1,
+      Math.min(Number(process.env.ENRICH_CONCURRENCY ?? 3), 10)
+    );
 
     let successCount = 0;
     let failureCount = 0;
@@ -291,24 +369,37 @@ export async function runsRoutes(app: FastifyInstance) {
     for (const row of existingRows as any[]) {
       if (row?.channelId) existingByChannelId.set(row.channelId, row);
     }
-    request.log.info(
-      {
-        runId,
-        forceEnrich,
-        existingRows: (existingRows as any[]).length,
-        existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
-      },
-      "ENRICH v10.1 idempotency precheck"
-    );
 
+    // Build queue to process (skip happens here once)
+    const toProcess: any[] = [];
     for (const r of found.results) {
       const channelId = r.channelId;
-
       const existing = existingByChannelId.get(channelId);
+
       if (!forceEnrich && existing?.status === "success") {
         skippedCount++;
         continue;
       }
+
+      toProcess.push(r);
+    }
+
+    request.log.info(
+      {
+        runId,
+        forceEnrich,
+        concurrency,
+        total: found.results.length,
+        toProcess: toProcess.length,
+        skippedCount,
+        existingRows: (existingRows as any[]).length,
+        existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
+      },
+      "ENRICH v10.2 concurrency precheck"
+    );
+
+    const outcomes = await runPool(toProcess, concurrency, async (r) => {
+      const channelId = r.channelId;
 
       try {
         // 1) Mark pending
@@ -317,7 +408,7 @@ export async function runsRoutes(app: FastifyInstance) {
         // 2) Fetch YouTube text
         const { description, recentTitles } = await getChannelText(channelId, 5);
 
-        // 3) Build prompt input (compact, deterministic)
+        // 3) Build prompt input
         const inputText = `
 Channel name: ${r.channelName}
 Subscribers: ${r.subscriberCount}
@@ -336,14 +427,18 @@ ${
 
 Task:
 Classify this channel for influencer scouting.
-      `.trim();
+        `.trim();
 
-        // 4) Call LLM (structured output)
-        const enrichment = await enrichChannel({
-          apiKey,
-          model,
-          inputText
-        });
+        // 4) Call LLM with retry/backoff (transient failures only)
+        const enrichment = await retryWithBackoff(
+          () =>
+            enrichChannel({
+              apiKey,
+              model,
+              inputText
+            }),
+          { retries: 2, baseMs: 500, maxMs: 4000 }
+        );
 
         // 5) Persist success
         await saveSuccess({
@@ -361,7 +456,7 @@ Classify this channel for influencer scouting.
           }
         });
 
-        successCount++;
+        return "success" as const;
       } catch (err: any) {
         await saveFailure({
           runId,
@@ -372,18 +467,22 @@ Classify this channel for influencer scouting.
           }
         });
 
-        failureCount++;
+        return "failed" as const;
       }
-    }
+    });
+
+    successCount = outcomes.filter((o) => o === "success").length;
+    failureCount = outcomes.filter((o) => o === "failed").length;
 
     return {
-      version: "10.1-idempotency",
+      version: "10.2-concurrency",
       run_id: runId,
       enriched: successCount,
       skipped: skippedCount,
       failed: failureCount,
       total: found.results.length,
-      forced: forceEnrich
+      forced: forceEnrich,
+      concurrency
     };
   });
 }
