@@ -98,10 +98,164 @@ async function runPool<T, R>(
   return results;
 }
 
+// Step 10.4: job registry + runner helper
+type EnrichJobState = {
+  status: "idle" | "running" | "done" | "failed";
+  startedAt?: string;
+  finishedAt?: string;
+  forced?: boolean;
+  concurrency?: number;
+  lastError?: string | null;
+};
+
+const enrichJobs = new Map<string, EnrichJobState>();
+
+async function runEnrichmentJob(args: {
+  runId: string;
+  forceEnrich: boolean;
+  apiKey: string;
+  model: string;
+  concurrency: number;
+  log: any;
+}): Promise<{ enriched: number; skipped: number; failed: number; total: number }> {
+  const { runId, forceEnrich, apiKey, model, concurrency, log } = args;
+
+  const found = await getRunById(runId);
+  if (!found) throw new Error("Run not found");
+
+  let skippedCount = 0;
+
+  // Prefetch existing enrichments for this run (idempotency)
+  const existingRows = await getEnrichmentsForRun(runId);
+  const existingByChannelId = new Map<string, any>();
+  for (const row of existingRows as any[]) {
+    if (row?.channelId) existingByChannelId.set(row.channelId, row);
+  }
+
+  // Build queue to process (skip happens here once)
+  const toProcess: any[] = [];
+  for (const r of found.results) {
+    const channelId = r.channelId;
+    const existing = existingByChannelId.get(channelId);
+
+    if (!forceEnrich && existing?.status === "success") {
+      skippedCount++;
+      continue;
+    }
+
+    toProcess.push(r);
+  }
+
+  log.info(
+    {
+      runId,
+      forceEnrich,
+      concurrency,
+      total: found.results.length,
+      toProcess: toProcess.length,
+      skippedCount,
+      existingRows: (existingRows as any[]).length,
+      existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
+    },
+    "ENRICH v10.4 async job precheck"
+  );
+
+  const outcomes = await runPool(toProcess, concurrency, async (r) => {
+    const channelId = r.channelId;
+
+    try {
+      // 1) Mark pending
+      await markPending({ runId, channelId });
+
+      // 2) Fetch YouTube text
+      const { description, recentTitles } = await getChannelText(channelId, 5);
+
+      // 3) Build prompt input
+      const inputText = `
+Channel name: ${r.channelName}
+Subscribers: ${r.subscriberCount}
+Average views (last N): ${r.avgViewsLastN}
+Days since last upload: ${r.daysSinceLastUpload}
+
+Channel description:
+${description || "(no description)"}
+
+Recent video titles:
+${
+  recentTitles.length
+    ? recentTitles.map((t) => `- ${t}`).join("\n")
+    : "(no recent titles)"
+}
+
+Task:
+Classify this channel for influencer scouting.
+      `.trim();
+
+      // 4) Call LLM with retry/backoff (transient failures only)
+      const enrichment = await retryWithBackoff(
+        () =>
+          enrichChannel({
+            apiKey,
+            model,
+            inputText
+          }),
+        { retries: 2, baseMs: 500, maxMs: 4000 }
+      );
+
+      // 5) Persist success
+      await saveSuccess({
+        runId,
+        channelId,
+        payload: {
+          model,
+          status: "success",
+          nicheLabels: enrichment.niche_labels,
+          languageDetected: enrichment.language_detected,
+          fitSummary: enrichment.fit_summary,
+          brandSafetyNotes: enrichment.brand_safety_notes,
+          redFlags: enrichment.red_flags,
+          raw: enrichment
+        }
+      });
+
+      return "success" as const;
+    } catch (err: any) {
+      await saveFailure({
+        runId,
+        channelId,
+        model,
+        error: {
+          message: err?.message ?? "Unknown enrichment error"
+        }
+      });
+
+      return "failed" as const;
+    }
+  });
+
+  const successCount = outcomes.filter((o) => o === "success").length;
+  const failureCount = outcomes.filter((o) => o === "failed").length;
+
+  return {
+    enriched: successCount,
+    skipped: skippedCount,
+    failed: failureCount,
+    total: found.results.length
+  };
+}
+
 export async function runsRoutes(app: FastifyInstance) {
   // DEBUG: confirms which runs.ts is currently running
   app.get("/debug/version", async () => {
     return { runs_ts: "10.2-concurrency", ts: new Date().toISOString() };
+  });
+
+  // GET /runs/:runId/enrich/job
+  // Step 10.4: in-memory job state (resets on server restart)
+  app.get("/runs/:runId/enrich/job", async (request) => {
+    const { runId } = request.params as { runId: string };
+    const state = enrichJobs.get(runId) ?? { status: "idle" };
+    return { version: "10.4-async", run_id: runId, job: state };
   });
 
   // POST /runs (real execution + persistence)
@@ -375,12 +529,13 @@ export async function runsRoutes(app: FastifyInstance) {
     };
   });
   // POST /runs/:runId/enrich
-  // Step 10.2: Concurrency + retries, while keeping 10.1 idempotency (skip success unless forced)
+  // Step 10.4: Non-blocking async job (in-process)
   app.post("/runs/:runId/enrich", async (request, reply) => {
     const { runId } = request.params as { runId: string };
     const { force } = request.query as { force?: string };
     const forceEnrich = force === "true" || force === "1";
 
+    // Validate run exists (cheap)
     const found = await getRunById(runId);
     if (!found) {
       return reply.status(404).send({ error: "Run not found" });
@@ -399,130 +554,75 @@ export async function runsRoutes(app: FastifyInstance) {
       Math.min(Number(process.env.ENRICH_CONCURRENCY ?? 3), 10)
     );
 
-    let successCount = 0;
-    let failureCount = 0;
-    let skippedCount = 0;
-
-    // Prefetch existing enrichments for this run (idempotency)
-    const existingRows = await getEnrichmentsForRun(runId);
-    const existingByChannelId = new Map<string, any>();
-    for (const row of existingRows as any[]) {
-      if (row?.channelId) existingByChannelId.set(row.channelId, row);
+    const existingJob = enrichJobs.get(runId);
+    if (existingJob?.status === "running") {
+      // Already running — return 202 with current job state
+      return reply.status(202).send({
+        version: "10.4-async",
+        run_id: runId,
+        accepted: false,
+        reason: "already_running",
+        job: existingJob
+      });
     }
 
-    // Build queue to process (skip happens here once)
-    const toProcess: any[] = [];
-    for (const r of found.results) {
-      const channelId = r.channelId;
-      const existing = existingByChannelId.get(channelId);
+    const startedAt = new Date().toISOString();
+    const jobState: EnrichJobState = {
+      status: "running",
+      startedAt,
+      forced: forceEnrich,
+      concurrency,
+      lastError: null
+    };
+    enrichJobs.set(runId, jobState);
 
-      if (!forceEnrich && existing?.status === "success") {
-        skippedCount++;
-        continue;
-      }
+    const log = request.log.child({ runId, forceEnrich, concurrency, job: "enrich" });
 
-      toProcess.push(r);
-    }
-
-    request.log.info(
-      {
+    // Fire-and-forget execution (do not await)
+    setImmediate(() => {
+      runEnrichmentJob({
         runId,
         forceEnrich,
+        apiKey,
+        model,
         concurrency,
-        total: found.results.length,
-        toProcess: toProcess.length,
-        skippedCount,
-        existingRows: (existingRows as any[]).length,
-        existingSuccess: (existingRows as any[]).filter((r) => r?.status === "success").length
-      },
-      "ENRICH v10.2 concurrency precheck"
-    );
+        log
+      })
+        .then((summary) => {
+          enrichJobs.set(runId, {
+            status: "done",
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            forced: forceEnrich,
+            concurrency,
+            lastError: null
+          });
 
-    const outcomes = await runPool(toProcess, concurrency, async (r) => {
-      const channelId = r.channelId;
+          log.info({ summary }, "ENRICH v10.4 async job done");
+        })
+        .catch((err: any) => {
+          enrichJobs.set(runId, {
+            status: "failed",
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            forced: forceEnrich,
+            concurrency,
+            lastError: err?.message ?? "Unknown error"
+          });
 
-      try {
-        // 1) Mark pending
-        await markPending({ runId, channelId });
-
-        // 2) Fetch YouTube text
-        const { description, recentTitles } = await getChannelText(channelId, 5);
-
-        // 3) Build prompt input
-        const inputText = `
-Channel name: ${r.channelName}
-Subscribers: ${r.subscriberCount}
-Average views (last N): ${r.avgViewsLastN}
-Days since last upload: ${r.daysSinceLastUpload}
-
-Channel description:
-${description || "(no description)"}
-
-Recent video titles:
-${
-  recentTitles.length
-    ? recentTitles.map((t) => `- ${t}`).join("\n")
-    : "(no recent titles)"
-}
-
-Task:
-Classify this channel for influencer scouting.
-        `.trim();
-
-        // 4) Call LLM with retry/backoff (transient failures only)
-        const enrichment = await retryWithBackoff(
-          () =>
-            enrichChannel({
-              apiKey,
-              model,
-              inputText
-            }),
-          { retries: 2, baseMs: 500, maxMs: 4000 }
-        );
-
-        // 5) Persist success
-        await saveSuccess({
-          runId,
-          channelId,
-          payload: {
-            model,
-            status: "success",
-            nicheLabels: enrichment.niche_labels,
-            languageDetected: enrichment.language_detected,
-            fitSummary: enrichment.fit_summary,
-            brandSafetyNotes: enrichment.brand_safety_notes,
-            redFlags: enrichment.red_flags,
-            raw: enrichment
-          }
+          log.error({ err }, "ENRICH v10.4 async job failed");
         });
-
-        return "success" as const;
-      } catch (err: any) {
-        await saveFailure({
-          runId,
-          channelId,
-          model,
-          error: {
-            message: err?.message ?? "Unknown enrichment error"
-          }
-        });
-
-        return "failed" as const;
-      }
     });
 
-    successCount = outcomes.filter((o) => o === "success").length;
-    failureCount = outcomes.filter((o) => o === "failed").length;
-
-    return {
-      version: "10.2-concurrency",
+    return reply.status(202).send({
+      version: "10.4-async",
       run_id: runId,
-      enriched: successCount,
-      skipped: skippedCount,
-      failed: failureCount,
-      total: found.results.length,
-      forced: forceEnrich,
-      concurrency
-    };
+      accepted: true,
+      job: enrichJobs.get(runId),
+      next: {
+        status: `/runs/${runId}/enrich/status`,
+        job: `/runs/${runId}/enrich/job`
+      }
+    });
   });
 }
