@@ -14,7 +14,7 @@ type YouTubeSearchVideoItem = {
 
 type YouTubeVideoListItem = {
   id: string;
-  snippet?: { publishedAt?: string };
+  snippet?: { publishedAt?: string; title?: string; description?: string };
   statistics?: { viewCount?: string };
 };
 
@@ -132,7 +132,13 @@ export async function getChannelDetails(
 export async function getRecentVideos(
   channelId: string,
   maxVideos: number
-): Promise<{ views: number[]; daysSinceLastUpload: number }> {
+): Promise<{
+  videoIds: string[];
+  views: number[];
+  titles: string[];
+  descriptions: string[];
+  daysSinceLastUpload: number;
+}> {
   const key = requireApiKey();
   const safeMax = Math.max(1, Math.min(maxVideos, 50));
 
@@ -150,7 +156,9 @@ export async function getRecentVideos(
   const videoIds =
     searchJson.items?.map((it) => it.id?.videoId).filter((id): id is string => Boolean(id)) ?? [];
 
-  if (videoIds.length === 0) return { views: [], daysSinceLastUpload: 9999 };
+  if (videoIds.length === 0) {
+    return { videoIds: [], views: [], titles: [], descriptions: [], daysSinceLastUpload: 9999 };
+  }
 
   const videosUrl = buildUrl("https://www.googleapis.com/youtube/v3/videos", {
     key,
@@ -169,6 +177,8 @@ export async function getRecentVideos(
   });
 
   const views = items.map((it) => Number(it.statistics?.viewCount ?? 0));
+  const titles = items.map((it) => it.snippet?.title ?? "");
+  const descriptions = items.map((it) => it.snippet?.description ?? "");
 
   const newestPublishedAt = items[0]?.snippet?.publishedAt;
   let daysSinceLastUpload = 9999;
@@ -178,7 +188,7 @@ export async function getRecentVideos(
     daysSinceLastUpload = Math.floor(diffMs / (1000 * 60 * 60 * 24));
   }
 
-  return { views, daysSinceLastUpload };
+  return { videoIds, views, titles, descriptions, daysSinceLastUpload };
 }
 
 // Move these types and function to top-level scope

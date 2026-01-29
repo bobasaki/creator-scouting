@@ -98,6 +98,86 @@ async function runPool<T, R>(
   return results;
 }
 
+// Step 11 (addon): sponsorship detection (heuristic, token-free)
+type SponsorshipEvidence = {
+  videoId: string;
+  where: "title" | "description";
+  match: string;
+};
+
+type SponsorshipScan = {
+  nVideos: number;
+  sponsoredCount: number;
+  ratio: number;
+  confidence: "low" | "medium" | "high";
+  evidence: SponsorshipEvidence[];
+};
+
+const SPONSORSHIP_PATTERNS: RegExp[] = [
+  // EN
+  /\b(sponsored|sponsor|paid partnership)\b/i,
+  /#(ad|sponsored)\b/i,
+  /\b(affiliate|promo code|discount code)\b/i,
+
+  // DE
+  /\b(werbung|anzeige|gesponsert|bezahlte partnerschaft)\b/i,
+  /\b(rabattcode|gutschein)\b/i,
+  /\b(link in der beschreibung)\b/i,
+
+  // NL
+  /\b(advertentie|gesponsord|betaalde samenwerking)\b/i,
+
+  // Generic
+  /\b(use code|code[:\s]+[A-Z0-9_-]{3,})\b/i,
+  /\b\d{1,2}%\s*(off|rabatt)\b/i
+];
+
+function detectSponsorships(input: {
+  videoIds: string[];
+  titles: string[];
+  descriptions: string[];
+  maxEvidence?: number;
+}): SponsorshipScan {
+  const { videoIds, titles, descriptions } = input;
+  const maxEvidence = input.maxEvidence ?? 25;
+
+  const n = Math.min(videoIds.length, titles.length, descriptions.length);
+  let sponsoredCount = 0;
+  const evidence: SponsorshipEvidence[] = [];
+
+  for (let i = 0; i < n; i++) {
+    const videoId = videoIds[i];
+    const t = titles[i] ?? "";
+    const d = descriptions[i] ?? "";
+
+    let hit: SponsorshipEvidence | null = null;
+
+    for (const rx of SPONSORSHIP_PATTERNS) {
+      const mt = t.match(rx);
+      if (mt?.[0]) {
+        hit = { videoId, where: "title", match: mt[0] };
+        break;
+      }
+      const md = d.match(rx);
+      if (md?.[0]) {
+        hit = { videoId, where: "description", match: md[0] };
+        break;
+      }
+    }
+
+    if (hit) {
+      sponsoredCount++;
+      if (evidence.length < maxEvidence) evidence.push(hit);
+    }
+  }
+
+  const ratio = n === 0 ? 0 : sponsoredCount / n;
+  const confidence: SponsorshipScan["confidence"] =
+    ratio >= 0.4 ? "high" : ratio >= 0.15 ? "medium" : sponsoredCount > 0 ? "low" : "low";
+
+  return { nVideos: n, sponsoredCount, ratio, confidence, evidence };
+}
+
 // Step 10.4: job registry + runner helper
 type EnrichJobState = {
   status: "idle" | "running" | "done" | "failed";
@@ -219,6 +299,18 @@ async function runEnrichmentJob(args: {
       // 2) Fetch YouTube text
       const { description, recentTitles } = await getChannelText(channelId, 5);
 
+      // 2b) Fetch recent videos (title/description) for sponsorship detection
+      const scanN = Math.max(
+        1,
+        Math.min(Number(process.env.SPONSORSHIP_SCAN_N ?? 10), 25)
+      );
+      const recent = await getRecentVideos(channelId, scanN);
+      const sponsorship = detectSponsorships({
+        videoIds: recent.videoIds ?? [],
+        titles: recent.titles ?? [],
+        descriptions: recent.descriptions ?? []
+      });
+
       // 3) Build prompt input
       const inputText = `
 Channel name: ${r.channelName}
@@ -263,7 +355,8 @@ Classify this channel for influencer scouting.
           fitSummary: enrichment.fit_summary,
           brandSafetyNotes: enrichment.brand_safety_notes,
           redFlags: enrichment.red_flags,
-          raw: enrichment
+          sponsorship,
+          raw: { ...enrichment, sponsorship }
         }
       });
 
@@ -409,8 +502,8 @@ export async function runsRoutes(app: FastifyInstance) {
           channelName: ch.channelName ?? ch.title ?? ch.name ?? channelId,
           channelUrl: ch.channelUrl ?? `https://youtube.com/channel/${channelId}`,
           subscriberCount: Number(ch.subscriberCount ?? 0),
-          recentViews: (videoData as any).views ?? [],
-          daysSinceLastUpload: Number((videoData as any).daysSinceLastUpload ?? 9999)
+          recentViews: videoData.views ?? [],
+          daysSinceLastUpload: Number(videoData.daysSinceLastUpload ?? 9999)
         });
 
         const passes = passesFilters(metrics, {
@@ -502,6 +595,7 @@ export async function runsRoutes(app: FastifyInstance) {
                   fitSummary: e.fitSummary ?? null,
                   brandSafetyNotes: e.brandSafetyNotes ?? null,
                   redFlags: e.redFlags ?? null,
+                  sponsorship: (e as any).sponsorship ?? (e.raw as any)?.sponsorship ?? null,
                   raw: e.raw ?? null
                 }
               }

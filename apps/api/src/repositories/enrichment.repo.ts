@@ -14,6 +14,7 @@ export type EnrichmentPayload = {
   brandSafetyNotes?: string;
   redFlags?: string[];
 
+  sponsorship?: any;
   raw?: any;
 };
 
