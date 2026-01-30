@@ -553,8 +553,110 @@ export async function runsRoutes(app: FastifyInstance) {
   // GET /runs/:runId (DB-backed retrieval)
   app.get("/runs/:runId", async (request, reply) => {
     const { runId } = request.params as { runId: string };
-    const { include } = request.query as { include?: string };
+    const {
+      include,
+      hasBrandAds,
+      minBrandAdsRatio,
+      minBrandAdsConfidence,
+      nicheIncludes,
+      languageDetected
+    } = request.query as {
+      include?: string;
+
+      // 11.3 filters (optional; require include=enrichment)
+      hasBrandAds?: string; // "true" | "false"
+      minBrandAdsRatio?: string; // "0.25"
+      minBrandAdsConfidence?: string; // "low" | "medium" | "high"
+      nicheIncludes?: string; // free-text
+      languageDetected?: string; // e.g. "German"
+    };
+
     const includeEnrichment = include === "enrichment";
+
+    const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+    const confRank = (c: any) => {
+      const v = String(c ?? "").toLowerCase();
+      if (v === "high") return 3;
+      if (v === "medium") return 2;
+      if (v === "low") return 1;
+      return 0;
+    };
+
+    // Bounded enrichment scoring: total adjustment is clamped to [-10, +10]
+    function enrichmentDelta(payload: any): { delta: number; why: string[] } {
+      let delta = 0;
+      const why: string[] = [];
+
+      // 1) Sponsored history boost (signals monetization readiness)
+      const ratio = Number(payload?.sponsorship?.ratio ?? 0);
+      const conf = confRank(payload?.brandAdsConfidence);
+
+      if (conf >= 2) {
+        if (ratio >= 0.5) {
+          delta += 8;
+          why.push(
+            `Sponsorship-heavy channel (ratio=${ratio.toFixed(2)}, confidence=${String(
+              payload?.brandAdsConfidence
+            )})`
+          );
+        } else if (ratio >= 0.2) {
+          delta += 5;
+          why.push(
+            `Some sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${String(
+              payload?.brandAdsConfidence
+            )})`
+          );
+        } else if (ratio > 0) {
+          delta += 2;
+          why.push(
+            `Light sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${String(
+              payload?.brandAdsConfidence
+            )})`
+          );
+        }
+      } else if (ratio > 0) {
+        delta += 1;
+        why.push(`Sponsorship signals detected but low confidence (ratio=${ratio.toFixed(2)})`);
+      }
+
+      // 2) Brand-safety penalty (simple heuristic on redFlags)
+      const redFlags: string[] = Array.isArray(payload?.redFlags) ? payload.redFlags : [];
+      const redText = redFlags.join(" | ").toLowerCase();
+
+      if (redText.includes("graphic") || redText.includes("gore") || redText.includes("disturb")) {
+        delta -= 4;
+        why.push("Brand-safety penalty: graphic/disturbing content risk");
+      }
+      if (redText.includes("copyright") || redText.includes("licensing") || redText.includes("rights")) {
+        delta -= 3;
+        why.push("Brand-safety penalty: licensing/copyright risk");
+      }
+      if (redText.includes("defamation") || redText.includes("misinformation")) {
+        delta -= 2;
+        why.push("Brand-safety penalty: defamation/misinformation risk");
+      }
+
+      // Clamp total adjustment
+      delta = clamp(delta, -10, 10);
+
+      return { delta, why };
+    }
+
+    // If any enrichment filter is present, require include=enrichment
+    const wantsEnrichmentFiltering =
+      hasBrandAds !== undefined ||
+      minBrandAdsRatio !== undefined ||
+      minBrandAdsConfidence !== undefined ||
+      nicheIncludes !== undefined ||
+      languageDetected !== undefined;
+
+    if (wantsEnrichmentFiltering && !includeEnrichment) {
+      return reply.status(400).send({
+        error: "Enrichment filters require include=enrichment",
+        hint: "Use /runs/:runId?include=enrichment&hasBrandAds=true (etc.)"
+      });
+    }
 
     const found = await getRunById(runId);
     if (!found) {
@@ -571,6 +673,27 @@ export async function runsRoutes(app: FastifyInstance) {
 
     const results = found.results.map((r: any) => {
       const e = includeEnrichment ? enrichmentByChannelId.get(r.channelId) : undefined;
+      const baseScore = Number(r.finalScore ?? 0);
+      let delta = 0;
+      let why: string[] = [];
+
+      if (includeEnrichment && e?.status === "success") {
+        const payload = {
+          nicheLabels: e.nicheLabels ?? null,
+          languageDetected: e.languageDetected ?? null,
+          fitSummary: e.fitSummary ?? null,
+          brandSafetyNotes: e.brandSafetyNotes ?? null,
+          redFlags: e.redFlags ?? null,
+          sponsorship: e.sponsorship ?? null,
+          hasBrandAdsLastN: e.hasBrandAdsLastN ?? null,
+          brandAdsConfidence: e.brandAdsConfidence ?? null,
+          raw: e.raw ?? null
+        };
+
+        const out = enrichmentDelta(payload);
+        delta = out.delta;
+        why = out.why;
+      }
 
       return {
         metrics: {
@@ -583,26 +706,100 @@ export async function runsRoutes(app: FastifyInstance) {
           recentViews: r.recentViews
         },
         scores: r.scores,
-        finalScore: r.finalScore,
+        finalScoreBase: baseScore,
+        finalScoreDelta: delta,
+        finalScore: baseScore + delta,
+        why,
         enrichment: includeEnrichment
           ? e
             ? {
                 status: e.status,
                 model: e.model ?? null,
-                payload: {
-                  nicheLabels: e.nicheLabels ?? null,
-                  languageDetected: e.languageDetected ?? null,
-                  fitSummary: e.fitSummary ?? null,
-                  brandSafetyNotes: e.brandSafetyNotes ?? null,
-                  redFlags: e.redFlags ?? null,
-                  sponsorship: (e as any).sponsorship ?? (e.raw as any)?.sponsorship ?? null,
-                  raw: e.raw ?? null
-                }
+                payload: (() => {
+                  const s = (e as any).sponsorship ?? (e.raw as any)?.sponsorship ?? null;
+
+                  return {
+                    nicheLabels: e.nicheLabels ?? null,
+                    languageDetected: e.languageDetected ?? null,
+                    fitSummary: e.fitSummary ?? null,
+                    brandSafetyNotes: e.brandSafetyNotes ?? null,
+                    redFlags: e.redFlags ?? null,
+
+                    sponsorship: s,
+                    hasBrandAdsLastN: s ? Number(s.sponsoredCount ?? 0) >= 1 : null,
+                    brandAdsConfidence: s ? s.confidence ?? null : null,
+
+                    raw: e.raw ?? null
+                  };
+                })()
               }
             : { status: "missing", model: null, payload: null }
           : undefined
       };
     });
+
+    // -------------------------
+    // 11.3 Apply enrichment filters (if requested)
+    // -------------------------
+    let filteredResults = results;
+
+    if (wantsEnrichmentFiltering) {
+      const minRatio = minBrandAdsRatio !== undefined ? Number(minBrandAdsRatio) : undefined;
+      const minConf =
+        minBrandAdsConfidence !== undefined ? confRank(minBrandAdsConfidence) : undefined;
+
+      filteredResults = results.filter((r: any) => {
+        const e = r.enrichment; // { status, model, payload } | {status:"missing"...} | undefined
+        const p = e?.payload;
+
+        // If enrichment isn't present yet, it can't pass enrichment filters
+        if (!p) return false;
+
+        // hasBrandAds filter
+        if (hasBrandAds !== undefined) {
+          const want = hasBrandAds === "true" || hasBrandAds === "1";
+          const actual = Boolean(p.hasBrandAdsLastN);
+          if (actual !== want) return false;
+        }
+
+        // minBrandAdsRatio filter
+        if (minRatio !== undefined && Number.isFinite(minRatio)) {
+          const ratio = Number(p?.sponsorship?.ratio ?? 0);
+          if (ratio < minRatio) return false;
+        }
+
+        // minBrandAdsConfidence filter
+        if (minConf !== undefined) {
+          const actual = confRank(p.brandAdsConfidence);
+          if (actual < minConf) return false;
+        }
+
+        // nicheIncludes filter (case-insensitive substring match against niche labels)
+        if (nicheIncludes !== undefined && nicheIncludes.trim().length > 0) {
+          const needle = nicheIncludes.trim().toLowerCase();
+          const labels: string[] = Array.isArray(p.nicheLabels) ? p.nicheLabels : [];
+          const ok = labels.some((x) => String(x).toLowerCase().includes(needle));
+          if (!ok) return false;
+        }
+
+        // languageDetected filter (case-insensitive exact match)
+        if (languageDetected !== undefined && languageDetected.trim().length > 0) {
+          const wantLang = languageDetected.trim().toLowerCase();
+          const actualLang = String(p.languageDetected ?? "").trim().toLowerCase();
+          if (!actualLang || actualLang !== wantLang) return false;
+        }
+
+        return true;
+      });
+    }
+
+    let resultsFinal = filteredResults;
+
+    if (includeEnrichment) {
+      resultsFinal = filteredResults
+        .slice()
+        .sort((a: any, b: any) => Number(b.finalScore ?? 0) - Number(a.finalScore ?? 0));
+    }
 
     return {
       run_id: found.run.id,
@@ -621,41 +818,278 @@ export async function runsRoutes(app: FastifyInstance) {
         min_subscribers: found.run.minSubscribers ?? undefined
       },
 
-      results
+      results: resultsFinal
     };
   });
 
   // GET /runs/:runId/export (DB-backed)
   app.get("/runs/:runId/export", async (request, reply) => {
     const { runId } = request.params as { runId: string };
-    const { format } = request.query as { format?: string };
+    const { format, include } = request.query as { format?: string; include?: string };
+    const includeEnrichment = include === "enrichment";
 
     const found = await getRunById(runId);
     if (!found) return reply.status(404).send({ error: "Run not found" });
 
     const results = found.results;
 
+    if (format === "json") {
+      // reuse the same output logic as GET /runs/:runId
+      // easiest/cleanest: call the same repo + mapping path here
+
+      const enrichmentByChannelId = new Map<string, any>();
+      if (includeEnrichment) {
+        const enrichments = await getEnrichmentsForRun(runId);
+        for (const e of enrichments as any[]) {
+          if ((e as any).channelId) enrichmentByChannelId.set((e as any).channelId, e);
+        }
+      }
+
+      const resultsJson = found.results.map((r: any) => {
+        const e = includeEnrichment ? enrichmentByChannelId.get(r.channelId) : undefined;
+
+        const baseScore = Number(r.finalScore ?? 0);
+
+        // If you implemented 11.4 in GET /runs/:runId, you likely already have these fields there.
+        // Here we keep it minimal: export whatever is already stored on the runResult row if you added it,
+        // otherwise compute a safe fallback.
+        const finalScoreBase = Number((r as any).finalScoreBase ?? baseScore);
+        const finalScoreDelta = Number((r as any).finalScoreDelta ?? 0);
+        const finalScoreFinal = Number((r as any).finalScore ?? baseScore + finalScoreDelta);
+
+        const why = Array.isArray((r as any).why) ? (r as any).why : [];
+
+        return {
+          metrics: {
+            channelId: r.channelId,
+            channelName: r.channelName,
+            channelUrl: r.channelUrl,
+            subscriberCount: r.subscriberCount,
+            avgViewsLastN: r.avgViewsLastN,
+            daysSinceLastUpload: r.daysSinceLastUpload,
+            recentViews: r.recentViews
+          },
+          scores: r.scores,
+
+          finalScoreBase,
+          finalScoreDelta,
+          finalScore: finalScoreFinal,
+          why,
+
+          enrichment: includeEnrichment
+            ? e
+              ? {
+                  status: e.status,
+                  model: e.model ?? null,
+                  payload: {
+                    nicheLabels: e.nicheLabels ?? null,
+                    languageDetected: e.languageDetected ?? null,
+                    fitSummary: e.fitSummary ?? null,
+                    brandSafetyNotes: e.brandSafetyNotes ?? null,
+                    redFlags: e.redFlags ?? null,
+                    sponsorship: e.sponsorship ?? null,
+                    hasBrandAdsLastN: e.hasBrandAdsLastN ?? null,
+                    brandAdsConfidence: e.brandAdsConfidence ?? null,
+                    raw: e.raw ?? null
+                  }
+                }
+              : { status: "missing", model: null, payload: null }
+            : undefined
+        };
+      });
+
+      return {
+        run_id: found.run.id,
+        created_at: new Date(found.run.createdAt).toISOString(),
+        input: {
+          keywords: found.run.keywords,
+          region: found.run.region,
+          language: found.run.language,
+          max_channels: found.run.maxChannels ?? undefined,
+          videos_to_analyze: found.run.videosToAnalyze ?? undefined,
+          min_avg_views: found.run.minAvgViews ?? undefined,
+          max_days_since_upload: found.run.maxDaysSinceLastUpload ?? undefined,
+          min_subscribers: found.run.minSubscribers ?? undefined
+        },
+        results: resultsJson
+      };
+    }
+
     if (format === "csv") {
       reply.header("Content-Type", "text/csv");
 
-      const header =
+      // 11.6: join enrichment rows for CSV when requested
+      const enrichmentByChannelId = new Map<string, any>();
+      if (includeEnrichment) {
+        const enrichments = await getEnrichmentsForRun(runId);
+        for (const e of enrichments as any[]) {
+          if ((e as any).channelId) enrichmentByChannelId.set((e as any).channelId, e);
+        }
+      }
+
+      const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+      const confRank = (c: any) => {
+        const v = String(c ?? "").toLowerCase();
+        if (v === "high") return 3;
+        if (v === "medium") return 2;
+        if (v === "low") return 1;
+        return 0;
+      };
+
+      // Same logic as GET /runs/:runId
+      function enrichmentDelta(payload: any): { delta: number; why: string[] } {
+        let delta = 0;
+        const why: string[] = [];
+
+        const ratio = Number(payload?.sponsorship?.ratio ?? 0);
+        const conf = confRank(payload?.brandAdsConfidence);
+
+        if (conf >= 2) {
+          if (ratio >= 0.5) {
+            delta += 8;
+            why.push(
+              `Sponsorship-heavy channel (ratio=${ratio.toFixed(2)}, confidence=${String(
+                payload?.brandAdsConfidence
+              )})`
+            );
+          } else if (ratio >= 0.2) {
+            delta += 5;
+            why.push(
+              `Some sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${String(
+                payload?.brandAdsConfidence
+              )})`
+            );
+          } else if (ratio > 0) {
+            delta += 2;
+            why.push(
+              `Light sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${String(
+                payload?.brandAdsConfidence
+              )})`
+            );
+          }
+        } else if (ratio > 0) {
+          delta += 1;
+          why.push(`Sponsorship signals detected but low confidence (ratio=${ratio.toFixed(2)})`);
+        }
+
+        const redFlags: string[] = Array.isArray(payload?.redFlags) ? payload.redFlags : [];
+        const redText = redFlags.join(" | ").toLowerCase();
+
+        if (redText.includes("graphic") || redText.includes("gore") || redText.includes("disturb")) {
+          delta -= 4;
+          why.push("Brand-safety penalty: graphic/disturbing content risk");
+        }
+        if (
+          redText.includes("copyright") ||
+          redText.includes("licensing") ||
+          redText.includes("rights")
+        ) {
+          delta -= 3;
+          why.push("Brand-safety penalty: licensing/copyright risk");
+        }
+        if (redText.includes("defamation") || redText.includes("misinformation")) {
+          delta -= 2;
+          why.push("Brand-safety penalty: defamation/misinformation risk");
+        }
+
+        delta = clamp(delta, -10, 10);
+        return { delta, why };
+      }
+
+      const headerBase =
         "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score\n";
+
+      const headerExtended =
+        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,final_score_base,final_score_delta,final_score_final,has_brand_ads_last_n,brand_ads_confidence,sponsorship_ratio,why,sponsor_evidence\n";
+
+      const header = includeEnrichment ? headerExtended : headerBase;
 
       // minimal CSV escaping for commas/quotes
       const esc = (v: any) => `"${String(v ?? "").replace(/"/g, '""')}"`;
 
       const rows = results
-        .map((r: any) =>
-          [
+        .map((r: any) => {
+          if (!includeEnrichment) {
+            return [
+              esc(r.channelId),
+              esc(r.channelName),
+              esc(r.channelUrl),
+              r.subscriberCount ?? 0,
+              r.avgViewsLastN ?? 0,
+              r.daysSinceLastUpload ?? 0,
+              r.finalScore ?? 0
+            ].join(",");
+          }
+
+          const base = Number(r.finalScore ?? 0);
+
+          // pull enrichment fields (if present)
+          const e = enrichmentByChannelId.get(r.channelId);
+          const sponsorship =
+            (e as any)?.sponsorship ??
+            (e as any)?.raw?.sponsorship ??
+            null;
+
+          const hasBrandAdsLastN =
+            sponsorship ? Number(sponsorship.sponsoredCount ?? 0) >= 1 : null;
+          const brandAdsConfidence =
+            sponsorship ? (sponsorship.confidence ?? null) : null;
+          const sponsorshipRatio =
+            sponsorship ? Number(sponsorship.ratio ?? 0) : null;
+
+          const evidenceArr = Array.isArray(sponsorship?.evidence) ? sponsorship.evidence : [];
+          const evidenceText = evidenceArr
+            .slice(0, 5)
+            .map((ev: any) => `${ev.videoId}:${ev.where}:${ev.match}`)
+            .join(" | ");
+
+          // compute delta + why from enrichment (only if success)
+          let delta = 0;
+          let whyText = "";
+
+          if (e?.status === "success") {
+            const payload = {
+              nicheLabels: e.nicheLabels ?? null,
+              languageDetected: e.languageDetected ?? null,
+              fitSummary: e.fitSummary ?? null,
+              brandSafetyNotes: e.brandSafetyNotes ?? null,
+              redFlags: e.redFlags ?? null,
+
+              sponsorship,
+              hasBrandAdsLastN: hasBrandAdsLastN,
+              brandAdsConfidence: brandAdsConfidence,
+
+              raw: e.raw ?? null
+            };
+
+            const out = enrichmentDelta(payload);
+            delta = out.delta;
+            whyText = out.why.join("; ");
+          }
+
+          const final = base + delta;
+
+          return [
             esc(r.channelId),
             esc(r.channelName),
             esc(r.channelUrl),
             r.subscriberCount ?? 0,
             r.avgViewsLastN ?? 0,
             r.daysSinceLastUpload ?? 0,
-            r.finalScore ?? 0
-          ].join(",")
-        )
+            r.finalScore ?? 0,
+
+            base,
+            delta,
+            final,
+
+            esc(hasBrandAdsLastN === null ? "" : String(Boolean(hasBrandAdsLastN))), // has_brand_ads_last_n
+            esc(brandAdsConfidence ?? ""), // brand_ads_confidence
+            esc(sponsorshipRatio === null ? "" : sponsorshipRatio.toFixed(4)), // sponsorship_ratio
+            esc(whyText),
+            esc(evidenceText)
+          ].join(",");
+        })
         .join("\n");
 
       reply.send(header + rows + "\n");
