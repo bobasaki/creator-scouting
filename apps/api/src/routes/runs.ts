@@ -387,6 +387,165 @@ Classify this channel for influencer scouting.
   };
 }
 
+// ------------------------------
+// Option A: shared view builder
+// ------------------------------
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function confRank(c: any) {
+  const v = String(c ?? "").toLowerCase();
+  if (v === "high") return 3;
+  if (v === "medium") return 2;
+  if (v === "low") return 1;
+  return 0;
+}
+
+function enrichmentDelta(payload: any): {
+  delta: number;
+  why: string[];
+  components: { sponsorship: number; brandSafety: number };
+} {
+  let sponsorshipDelta = 0;
+  let brandSafetyDelta = 0;
+  const why: string[] = [];
+
+  const ratio = Number(payload?.sponsorship?.ratio ?? 0);
+  const conf = confRank(payload?.brandAdsConfidence);
+
+  // Sponsorship component
+  if (conf >= 2) {
+    if (ratio >= 0.5) {
+      sponsorshipDelta += 8;
+      why.push(
+        `Sponsorship-heavy channel (ratio=${ratio.toFixed(2)}, confidence=${payload?.brandAdsConfidence})`
+      );
+    } else if (ratio >= 0.2) {
+      sponsorshipDelta += 5;
+      why.push(
+        `Some sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${payload?.brandAdsConfidence})`
+      );
+    } else if (ratio > 0) {
+      sponsorshipDelta += 2;
+      why.push(
+        `Light sponsorship presence (ratio=${ratio.toFixed(2)}, confidence=${payload?.brandAdsConfidence})`
+      );
+    }
+  } else if (ratio > 0) {
+    sponsorshipDelta += 1;
+    why.push(`Sponsorship signals detected but low confidence (ratio=${ratio.toFixed(2)})`);
+  }
+
+  // Brand-safety component
+  const redFlags: string[] = Array.isArray(payload?.redFlags) ? payload.redFlags : [];
+  const redText = redFlags.join(" | ").toLowerCase();
+
+  if (redText.includes("graphic") || redText.includes("gore") || redText.includes("disturb")) {
+    brandSafetyDelta -= 4;
+    why.push("Brand-safety penalty: graphic/disturbing content risk");
+  }
+  if (redText.includes("copyright") || redText.includes("licensing") || redText.includes("rights")) {
+    brandSafetyDelta -= 3;
+    why.push("Brand-safety penalty: licensing/copyright risk");
+  }
+  if (redText.includes("defamation") || redText.includes("misinformation")) {
+    brandSafetyDelta -= 2;
+    why.push("Brand-safety penalty: defamation/misinformation risk");
+  }
+
+  const delta = clamp(sponsorshipDelta + brandSafetyDelta, -10, 10);
+
+  return {
+    delta,
+    why,
+    components: {
+      sponsorship: sponsorshipDelta,
+      brandSafety: brandSafetyDelta
+    }
+  };
+}
+
+function buildRunResultView(args: {
+  runResult: any;
+  enrichmentRow?: any;
+  includeEnrichment: boolean;
+}) {
+  const { runResult: r, enrichmentRow: e, includeEnrichment } = args;
+
+  const baseScore = Number(r.finalScore ?? 0);
+  let delta = 0;
+  let why: string[] = [];
+  let deltaComponents: { sponsorship: number; brandSafety: number } | undefined = undefined;
+  let enrichmentOut: any = undefined;
+
+  if (includeEnrichment) {
+    if (e?.status === "success") {
+      const s = e.sponsorship ?? e.raw?.sponsorship ?? null;
+
+      const payload = {
+        nicheLabels: e.nicheLabels ?? null,
+        languageDetected: e.languageDetected ?? null,
+        fitSummary: e.fitSummary ?? null,
+        brandSafetyNotes: e.brandSafetyNotes ?? null,
+        redFlags: e.redFlags ?? null,
+        sponsorship: s,
+        hasBrandAdsLastN: s ? Number(s.sponsoredCount ?? 0) > 0 : null,
+        brandAdsConfidence: s?.confidence ?? null,
+        raw: e.raw ?? null
+      };
+
+      const out = enrichmentDelta(payload);
+      delta = out.delta;
+      why = out.why;
+      deltaComponents = out.components;
+
+      enrichmentOut = { status: e.status, model: e.model ?? null, payload };
+    } else if (e) {
+      enrichmentOut = { status: e.status, model: e.model ?? null, payload: null };
+    } else {
+      enrichmentOut = { status: "missing", model: null, payload: null };
+    }
+  }
+
+  // --- Step 11.8: Unified score_breakdown ---
+  const baseComponents = r.scores ?? {};
+  const scoreBreakdown = {
+    base: {
+      total: baseScore,
+      components: baseComponents
+    },
+    enrichment: {
+      total: delta,
+      components: deltaComponents ?? { sponsorship: 0, brandSafety: 0 }
+    },
+    final: baseScore + delta
+  };
+  // ------------------------------------------
+
+  return {
+    metrics: {
+      channelId: r.channelId,
+      channelName: r.channelName,
+      channelUrl: r.channelUrl,
+      subscriberCount: r.subscriberCount,
+      avgViewsLastN: r.avgViewsLastN,
+      daysSinceLastUpload: r.daysSinceLastUpload,
+      recentViews: r.recentViews
+    },
+    scores: r.scores,
+    finalScoreBase: baseScore,
+    finalScoreDelta: delta,
+    finalScoreFinal: baseScore + delta,
+    finalScore: baseScore + delta,
+    why,
+    deltaComponents,
+    enrichment: enrichmentOut,
+    score_breakdown: scoreBreakdown,
+    score_version: "11.8"
+  };
+}
+
 export async function runsRoutes(app: FastifyInstance) {
   // DEBUG: confirms which runs.ts is currently running
   app.get("/debug/version", async () => {
@@ -673,69 +832,7 @@ export async function runsRoutes(app: FastifyInstance) {
 
     const results = found.results.map((r: any) => {
       const e = includeEnrichment ? enrichmentByChannelId.get(r.channelId) : undefined;
-      const baseScore = Number(r.finalScore ?? 0);
-      let delta = 0;
-      let why: string[] = [];
-
-      if (includeEnrichment && e?.status === "success") {
-        const payload = {
-          nicheLabels: e.nicheLabels ?? null,
-          languageDetected: e.languageDetected ?? null,
-          fitSummary: e.fitSummary ?? null,
-          brandSafetyNotes: e.brandSafetyNotes ?? null,
-          redFlags: e.redFlags ?? null,
-          sponsorship: e.sponsorship ?? null,
-          hasBrandAdsLastN: e.hasBrandAdsLastN ?? null,
-          brandAdsConfidence: e.brandAdsConfidence ?? null,
-          raw: e.raw ?? null
-        };
-
-        const out = enrichmentDelta(payload);
-        delta = out.delta;
-        why = out.why;
-      }
-
-      return {
-        metrics: {
-          channelId: r.channelId,
-          channelName: r.channelName,
-          channelUrl: r.channelUrl,
-          subscriberCount: r.subscriberCount,
-          avgViewsLastN: r.avgViewsLastN,
-          daysSinceLastUpload: r.daysSinceLastUpload,
-          recentViews: r.recentViews
-        },
-        scores: r.scores,
-        finalScoreBase: baseScore,
-        finalScoreDelta: delta,
-        finalScore: baseScore + delta,
-        why,
-        enrichment: includeEnrichment
-          ? e
-            ? {
-                status: e.status,
-                model: e.model ?? null,
-                payload: (() => {
-                  const s = (e as any).sponsorship ?? (e.raw as any)?.sponsorship ?? null;
-
-                  return {
-                    nicheLabels: e.nicheLabels ?? null,
-                    languageDetected: e.languageDetected ?? null,
-                    fitSummary: e.fitSummary ?? null,
-                    brandSafetyNotes: e.brandSafetyNotes ?? null,
-                    redFlags: e.redFlags ?? null,
-
-                    sponsorship: s,
-                    hasBrandAdsLastN: s ? Number(s.sponsoredCount ?? 0) >= 1 : null,
-                    brandAdsConfidence: s ? s.confidence ?? null : null,
-
-                    raw: e.raw ?? null
-                  };
-                })()
-              }
-            : { status: "missing", model: null, payload: null }
-          : undefined
-      };
+      return buildRunResultView({ runResult: r, enrichmentRow: e, includeEnrichment });
     });
 
     // -------------------------
@@ -847,55 +944,7 @@ export async function runsRoutes(app: FastifyInstance) {
 
       const resultsJson = found.results.map((r: any) => {
         const e = includeEnrichment ? enrichmentByChannelId.get(r.channelId) : undefined;
-
-        const baseScore = Number(r.finalScore ?? 0);
-
-        // If you implemented 11.4 in GET /runs/:runId, you likely already have these fields there.
-        // Here we keep it minimal: export whatever is already stored on the runResult row if you added it,
-        // otherwise compute a safe fallback.
-        const finalScoreBase = Number((r as any).finalScoreBase ?? baseScore);
-        const finalScoreDelta = Number((r as any).finalScoreDelta ?? 0);
-        const finalScoreFinal = Number((r as any).finalScore ?? baseScore + finalScoreDelta);
-
-        const why = Array.isArray((r as any).why) ? (r as any).why : [];
-
-        return {
-          metrics: {
-            channelId: r.channelId,
-            channelName: r.channelName,
-            channelUrl: r.channelUrl,
-            subscriberCount: r.subscriberCount,
-            avgViewsLastN: r.avgViewsLastN,
-            daysSinceLastUpload: r.daysSinceLastUpload,
-            recentViews: r.recentViews
-          },
-          scores: r.scores,
-
-          finalScoreBase,
-          finalScoreDelta,
-          finalScore: finalScoreFinal,
-          why,
-
-          enrichment: includeEnrichment
-            ? e
-              ? {
-                  status: e.status,
-                  model: e.model ?? null,
-                  payload: {
-                    nicheLabels: e.nicheLabels ?? null,
-                    languageDetected: e.languageDetected ?? null,
-                    fitSummary: e.fitSummary ?? null,
-                    brandSafetyNotes: e.brandSafetyNotes ?? null,
-                    redFlags: e.redFlags ?? null,
-                    sponsorship: e.sponsorship ?? null,
-                    hasBrandAdsLastN: e.hasBrandAdsLastN ?? null,
-                    brandAdsConfidence: e.brandAdsConfidence ?? null,
-                    raw: e.raw ?? null
-                  }
-                }
-              : { status: "missing", model: null, payload: null }
-            : undefined
-        };
+        return buildRunResultView({ runResult: r, enrichmentRow: e, includeEnrichment });
       });
 
       return {
@@ -998,10 +1047,10 @@ export async function runsRoutes(app: FastifyInstance) {
       }
 
       const headerBase =
-        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score\n";
+        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,score_version\n";
 
       const headerExtended =
-        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,final_score_base,final_score_delta,final_score_final,has_brand_ads_last_n,brand_ads_confidence,sponsorship_ratio,why,sponsor_evidence\n";
+        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,final_score_base,final_score_delta,final_score_final,has_brand_ads_last_n,brand_ads_confidence,sponsorship_ratio,why,sponsor_evidence,score_version\n";
 
       const header = includeEnrichment ? headerExtended : headerBase;
 
@@ -1018,76 +1067,57 @@ export async function runsRoutes(app: FastifyInstance) {
               r.subscriberCount ?? 0,
               r.avgViewsLastN ?? 0,
               r.daysSinceLastUpload ?? 0,
-              r.finalScore ?? 0
+              r.finalScore ?? 0,
+              esc("11.8")
             ].join(",");
           }
 
-          const base = Number(r.finalScore ?? 0);
-
-          // pull enrichment fields (if present)
+          // Use shared view builder for consistent logic
           const e = enrichmentByChannelId.get(r.channelId);
-          const sponsorship =
-            (e as any)?.sponsorship ??
-            (e as any)?.raw?.sponsorship ??
-            null;
+          const view = buildRunResultView({ runResult: r, enrichmentRow: e, includeEnrichment });
 
-          const hasBrandAdsLastN =
-            sponsorship ? Number(sponsorship.sponsoredCount ?? 0) >= 1 : null;
-          const brandAdsConfidence =
-            sponsorship ? (sponsorship.confidence ?? null) : null;
-          const sponsorshipRatio =
-            sponsorship ? Number(sponsorship.ratio ?? 0) : null;
-
-          const evidenceArr = Array.isArray(sponsorship?.evidence) ? sponsorship.evidence : [];
-          const evidenceText = evidenceArr
-            .slice(0, 5)
-            .map((ev: any) => `${ev.videoId}:${ev.where}:${ev.match}`)
-            .join(" | ");
-
-          // compute delta + why from enrichment (only if success)
-          let delta = 0;
-          let whyText = "";
-
-          if (e?.status === "success") {
-            const payload = {
-              nicheLabels: e.nicheLabels ?? null,
-              languageDetected: e.languageDetected ?? null,
-              fitSummary: e.fitSummary ?? null,
-              brandSafetyNotes: e.brandSafetyNotes ?? null,
-              redFlags: e.redFlags ?? null,
-
-              sponsorship,
-              hasBrandAdsLastN: hasBrandAdsLastN,
-              brandAdsConfidence: brandAdsConfidence,
-
-              raw: e.raw ?? null
-            };
-
-            const out = enrichmentDelta(payload);
-            delta = out.delta;
-            whyText = out.why.join("; ");
+          // sponsor evidence
+          let sponsorEvidence = "";
+          if (
+            view.enrichment &&
+            view.enrichment.payload &&
+            view.enrichment.payload.sponsorship &&
+            Array.isArray(view.enrichment.payload.sponsorship.evidence)
+          ) {
+            sponsorEvidence = view.enrichment.payload.sponsorship.evidence
+              .slice(0, 5)
+              .map((ev: any) => `${ev.videoId}:${ev.where}:${ev.match}`)
+              .join(" | ");
           }
 
-          const final = base + delta;
-
           return [
-            esc(r.channelId),
-            esc(r.channelName),
-            esc(r.channelUrl),
-            r.subscriberCount ?? 0,
-            r.avgViewsLastN ?? 0,
-            r.daysSinceLastUpload ?? 0,
-            r.finalScore ?? 0,
+            esc(view.metrics.channelId),
+            esc(view.metrics.channelName),
+            esc(view.metrics.channelUrl),
+            view.metrics.subscriberCount ?? 0,
+            view.metrics.avgViewsLastN ?? 0,
+            view.metrics.daysSinceLastUpload ?? 0,
+            view.finalScore ?? 0,
 
-            base,
-            delta,
-            final,
+            view.finalScoreBase,
+            view.finalScoreDelta,
+            view.finalScoreFinal,
 
-            esc(hasBrandAdsLastN === null ? "" : String(Boolean(hasBrandAdsLastN))), // has_brand_ads_last_n
-            esc(brandAdsConfidence ?? ""), // brand_ads_confidence
-            esc(sponsorshipRatio === null ? "" : sponsorshipRatio.toFixed(4)), // sponsorship_ratio
-            esc(whyText),
-            esc(evidenceText)
+            esc(
+              view.enrichment?.payload?.hasBrandAdsLastN === null
+                ? ""
+                : String(Boolean(view.enrichment?.payload?.hasBrandAdsLastN))
+            ),
+            esc(view.enrichment?.payload?.brandAdsConfidence ?? ""),
+            esc(
+              view.enrichment?.payload?.sponsorship?.ratio === undefined ||
+                view.enrichment?.payload?.sponsorship?.ratio === null
+                ? ""
+                : Number(view.enrichment?.payload?.sponsorship?.ratio).toFixed(4)
+            ),
+            esc(Array.isArray(view.why) ? view.why.join("; ") : ""),
+            esc(sponsorEvidence),
+            esc("11.8")
           ].join(",");
         })
         .join("\n");
