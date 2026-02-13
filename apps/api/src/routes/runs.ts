@@ -9,7 +9,6 @@ import { passesFilters } from "../domain/filter";
 import {
   markPending,
   saveSuccess,
-  saveFailure,
   getEnrichmentsForRun
 } from "../repositories/enrichment.repo";
 
@@ -19,11 +18,16 @@ import {
   getRecentVideos,
   getChannelText
 } from "../integrations/youtube/client";
+import { ExternalApiError } from "../errors/externalApiError";
 import { mapYoutubeToChannelMetrics } from "../integrations/youtube/mapper";
 
 import { enrichChannel } from "../integrations/llm/openai";
 
-import { createRunWithResults, getRunById } from "../repositories/runs.repo";
+import {
+  createRunWithResults,
+  getRunById,
+  listRecentRuns
+} from "../repositories/runs.repo";
 
 /**
  * 10.2 helpers: retry + concurrency pool
@@ -280,6 +284,8 @@ async function runEnrichmentJob(args: {
     "ENRICH v10.7 claim precheck"
   );
 
+  let failed = 0;
+
   const outcomes = await runPool(toProcess, concurrency, async (r) => {
     // Step 10.5: stop quickly if job has been marked failed/done (e.g., timeout)
     const jobState = enrichJobs.get(runId);
@@ -361,22 +367,33 @@ Classify this channel for influencer scouting.
       });
 
       return "success" as const;
-    } catch (err: any) {
-      await saveFailure({
-        runId,
-        channelId,
-        model,
-        error: {
-          message: err?.message ?? "Unknown enrichment error"
-        }
-      });
+    } catch (err) {
+      failed++;
+
+      const rawMsg =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err);
+      const msg =
+        typeof rawMsg === "string" && rawMsg.trim().length > 0
+          ? rawMsg
+          : "One or more channels failed enrichment (see logs)";
+
+      const job = enrichJobs.get(runId);
+      if (job && (!job.lastError || String(job.lastError).trim() === "")) {
+        job.lastError = msg;
+      }
+
+      log.error({ runId, channelId, err: msg }, "ENRICH failed");
 
       return "failed" as const;
     }
   });
 
   const successCount = outcomes.filter((o) => o === "success").length;
-  const failureCount = outcomes.filter((o) => o === "failed").length;
+  const failureCount = Math.max(failed, outcomes.filter((o) => o === "failed").length);
   const claimedSkipCount = outcomes.filter((o) => o === "skipped").length;
 
   return {
@@ -578,7 +595,32 @@ export async function runsRoutes(app: FastifyInstance) {
       for (const e of enrichments as any[]) {
         const s = String((e as any).status ?? "").toLowerCase();
         if (s === "success") success++;
-        else if (s === "failed") failed++;
+        else if (s === "failed") {
+          failed++;
+          const row = e as any;
+          const msgCandidates = [
+            row?.error?.message,
+            row?.error,
+            row?.message,
+            row?.reason,
+            row?.details,
+            row?.raw?.error?.message,
+            row?.raw?.error,
+            row?.raw?.message,
+            row?.raw?.reason,
+            row?.raw?.details
+          ];
+          const msg =
+            msgCandidates
+              .map((v) =>
+                typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
+              )
+              .find((v) => v.trim().length > 0) ??
+            "One or more channels failed enrichment (see logs)";
+          if (!(job as any).lastError || String((job as any).lastError).trim() === "") {
+            (job as any).lastError = msg;
+          }
+        }
         else if (s === "pending") pending++;
         else other++;
       }
@@ -702,11 +744,42 @@ export async function runsRoutes(app: FastifyInstance) {
       };
     } catch (err: any) {
       request.log.error({ err }, "POST /runs failed");
+      if (err instanceof ExternalApiError) {
+        if (err.code === "YOUTUBE_QUOTA_EXCEEDED") {
+          return reply
+            .code(429)
+            .send({ error: err.code, message: err.message });
+        }
+        if (err.code === "YOUTUBE_API_ERROR") {
+          return reply
+            .code(502)
+            .send({ error: err.code, message: err.message });
+        }
+      }
       return reply.status(500).send({
         error: "Internal error",
         code: "RUN_EXECUTION_FAILED"
       });
     }
+  });
+
+  // GET /runs (recent runs list)
+  app.get("/runs", async (request, reply) => {
+    const { limit } = request.query as { limit?: string };
+    const parsedLimit = limit ? Number(limit) : undefined;
+    const rows = await listRecentRuns(Number.isFinite(parsedLimit) ? parsedLimit : 20);
+
+    return rows.map((run: any) => ({
+      run_id: run.id,
+      created_at: new Date(run.createdAt).toISOString(),
+      input: {
+        keywords: run.keywords ?? [],
+        region: run.region,
+        language: run.language,
+        max_channels: run.maxChannels ?? null,
+        videos_to_analyze: run.videosToAnalyze ?? null
+      }
+    }));
   });
 
   // GET /runs/:runId (DB-backed retrieval)
@@ -1150,11 +1223,37 @@ export async function runsRoutes(app: FastifyInstance) {
     let failed = 0;
     let pending = 0;
     let other = 0;
+    const job = enrichJobs.get(runId);
 
     for (const e of enrichments as any[]) {
       const s = String((e as any).status ?? "").toLowerCase();
       if (s === "success") success++;
-      else if (s === "failed") failed++;
+      else if (s === "failed") {
+        failed++;
+        const row = e as any;
+        const msgCandidates = [
+          row?.error?.message,
+          row?.error,
+          row?.message,
+          row?.reason,
+          row?.details,
+          row?.raw?.error?.message,
+          row?.raw?.error,
+          row?.raw?.message,
+          row?.raw?.reason,
+          row?.raw?.details
+        ];
+        const msg =
+          msgCandidates
+            .map((v) =>
+              typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
+            )
+            .find((v) => v.trim().length > 0) ??
+          "One or more channels failed enrichment (see logs)";
+        if (job && (!job.lastError || String(job.lastError).trim() === "")) {
+          job.lastError = msg;
+        }
+      }
       else if (s === "pending") pending++;
       else other++;
     }

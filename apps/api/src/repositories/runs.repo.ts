@@ -80,3 +80,21 @@ export async function getRunById(runId: string): Promise<null | { run: any; resu
     results: run.results
   };
 }
+
+export async function listRecentRuns(limit = 20): Promise<any[]> {
+  const safeLimit = Math.max(1, Math.min(limit, 100));
+
+  return prisma.run.findMany({
+    orderBy: { createdAt: "desc" },
+    take: safeLimit,
+    select: {
+      id: true,
+      createdAt: true,
+      keywords: true,
+      region: true,
+      language: true,
+      maxChannels: true,
+      videosToAnalyze: true
+    }
+  });
+}

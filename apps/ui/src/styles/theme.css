@@ -1,0 +1,39 @@
+:root {
+  --font-sans: var(--font-geist-sans, "Inter", "Segoe UI", Arial, sans-serif);
+  --font-mono: var(--font-geist-mono, "SFMono-Regular", Menlo, monospace);
+
+  --color-bg: #f5f6fa;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f1f3f8;
+  --color-border: #e2e6ef;
+  --color-border-strong: #c9d1e0;
+  --color-text: #0f172a;
+  --color-muted: #5b6475;
+  --color-accent: #1f2a44;
+  --color-accent-soft: #e7edf7;
+  --color-success: #0f766e;
+  --color-success-soft: #d5f3ee;
+  --color-warning: #b45309;
+  --color-warning-soft: #fbe8d0;
+  --color-danger: #b42318;
+  --color-danger-soft: #fde7e5;
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 6px 20px rgba(15, 23, 42, 0.08);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 48px;
+
+  --container-max: 960px;
+}

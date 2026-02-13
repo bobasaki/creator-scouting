@@ -1,0 +1,25 @@
+.row {
+  display: block;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.row:hover {
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.title {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--color-text);
+}
+
+.meta {
+  margin-top: 4px;
+  color: var(--color-muted);
+  font-size: 12px;
+}

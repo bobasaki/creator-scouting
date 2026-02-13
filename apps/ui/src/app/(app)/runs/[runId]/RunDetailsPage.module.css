@@ -1,0 +1,131 @@
+.page {
+  display: grid;
+  gap: var(--space-6);
+}
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.headerLeft {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.runIdRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.runTitle {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.runCode {
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-muted);
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.createdAt {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.metaRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.metaBadge {
+  font-size: 11px;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.forceToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.checkbox {
+  width: 14px;
+  height: 14px;
+}
+
+.jobStatusRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.jobMeta {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.jobCounts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+@media (min-width: 900px) {
+  .jobCounts {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.jobError {
+  border-radius: var(--radius-sm);
+  border: 1px solid #f4c9c7;
+  background: var(--color-danger-soft);
+  color: var(--color-danger);
+  padding: var(--space-2) var(--space-3);
+  font-size: 12px;
+}
+
+.progress {
+  display: grid;
+  gap: 6px;
+}
+
+.progressBar {
+  height: 6px;
+  background: var(--color-surface-muted);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--color-accent);
+  transition: width 0.2s ease;
+}
+
+.sectionTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+}

@@ -1,0 +1,169 @@
+.wrapper {
+  max-height: 520px;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.headerRow {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--color-surface-muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--color-muted);
+}
+
+.th,
+.td {
+  border-bottom: 1px solid var(--color-border);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rowOdd {
+  background: var(--color-surface);
+}
+
+.rowEven {
+  background: #f8f9fc;
+}
+
+.numeric {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.emphasis {
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.sortButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0;
+}
+
+.sortButton:hover {
+  color: var(--color-text);
+}
+
+.link {
+  color: var(--color-accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.link:hover {
+  text-decoration: underline;
+}
+
+.badgePositive {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.badgeNeutral {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--color-surface-muted);
+  color: var(--color-muted);
+}
+
+.badgeWarning {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.why {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.whyText {
+  color: var(--color-text);
+}
+
+.detailsRow {
+  background: var(--color-surface-muted);
+}
+
+.detailsCell {
+  padding: var(--space-3);
+}
+
+.detailsGrid {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.detailsSection {
+  display: grid;
+  gap: 4px;
+}
+
+.detailsBody {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+
+.detailsTitle {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.detailsButton {
+  border: none;
+  background: transparent;
+  color: var(--color-accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0;
+}

@@ -1,0 +1,13 @@
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) 0;
+}
+
+.errorText {
+  color: #b91c1c;
+  font-size: 0.75rem;
+  line-height: 1.2;
+}

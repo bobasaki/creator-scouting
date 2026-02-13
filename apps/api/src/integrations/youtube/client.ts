@@ -1,3 +1,5 @@
+import { ExternalApiError } from "../../errors/externalApiError";
+
 type YouTubeSearchChannelItem = {
   id?: { channelId?: string };
 };
@@ -17,6 +19,17 @@ type YouTubeVideoListItem = {
   snippet?: { publishedAt?: string; title?: string; description?: string };
   statistics?: { viewCount?: string };
 };
+
+type YouTubeErrorResponse = {
+  error?: {
+    message?: string;
+    errors?: { reason?: string }[];
+  };
+};
+
+function stripHtml(value: string) {
+  return value.replace(/<[^>]*>/g, "");
+}
 
 function requireApiKey(): string {
   const key = process.env.YOUTUBE_API_KEY;
@@ -44,10 +57,32 @@ async function fetchJson<T>(url: string): Promise<T> {
   }
 
   if (!res.ok) {
-    const message =
-      (data && data.error && (data.error.message || data.error.errors?.[0]?.reason)) ||
-      `HTTP ${res.status}`;
-    throw new Error(`YouTube API request failed: ${message}`);
+    const errData = data as YouTubeErrorResponse;
+    const reason = errData?.error?.errors?.[0]?.reason;
+    const rawMessage =
+      errData?.error?.message || reason || (typeof data?.raw === "string" ? data.raw : "");
+    const message = stripHtml(
+      rawMessage && String(rawMessage).trim().length > 0
+        ? String(rawMessage)
+        : `HTTP ${res.status}`
+    );
+    const lowerMessage = message.toLowerCase();
+    const isQuota =
+      reason === "quotaExceeded" ||
+      reason === "dailyLimitExceeded" ||
+      lowerMessage.includes("exceeded your quota");
+
+    if (isQuota) {
+      throw new ExternalApiError(429, "YOUTUBE_QUOTA_EXCEEDED", "YouTube API quota exceeded", {
+        reason,
+        message
+      });
+    }
+
+    throw new ExternalApiError(502, "YOUTUBE_API_ERROR", "YouTube API request failed", {
+      reason,
+      message
+    });
   }
 
   return data as T;
