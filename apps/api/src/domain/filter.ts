@@ -5,8 +5,22 @@ export function passesFilters(
   filters: FilterParams
 ): boolean {
   if (
+    filters.minViews !== undefined &&
+    channel.minViewsLastN < filters.minViews
+  ) {
+    return false;
+  }
+
+  if (
     filters.minAvgViews !== undefined &&
     channel.avgViewsLastN < filters.minAvgViews
+  ) {
+    return false;
+  }
+
+  if (
+    filters.minEngagementRate !== undefined &&
+    channel.engagementRateLastN < filters.minEngagementRate
   ) {
     return false;
   }

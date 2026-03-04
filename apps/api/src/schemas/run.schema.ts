@@ -4,14 +4,19 @@ import { AppConfig } from "../config";
 export const RunRequestSchema = z.object({
   keywords: z
     .array(z.string().min(1))
-    .min(1, "At least one keyword is required")
     .max(AppConfig.limits.maxKeywords),
+  exclude_keywords: z
+    .array(z.string().min(1))
+    .max(AppConfig.limits.maxKeywords)
+    .optional(),
 
   region: z.string().length(2),
   language: z.string().min(2).max(5),
 
+  min_views: z.number().nonnegative().optional(),
   min_avg_views: z.number().nonnegative().optional(),
-  max_days_since_upload: z.number().positive().optional(),
+  max_days_since_upload: z.number().nonnegative().optional(),
+  min_engagement_rate: z.number().nonnegative().optional(),
   min_subscribers: z.number().nonnegative().optional(),
 
   videos_to_analyze: z

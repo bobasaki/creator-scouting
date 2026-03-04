@@ -2,12 +2,16 @@
   position: fixed;
   inset: 0 auto 0 0;
   width: 260px;
-  background: var(--color-surface);
-  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  background: linear-gradient(180deg, #0c1537 0%, #14245f 100%);
+  border-right: 1px solid color-mix(in srgb, var(--color-accent) 34%, transparent);
   padding: var(--space-4);
   transform: translateX(-100%);
   transition: transform 0.2s ease;
   z-index: 30;
+  box-shadow: var(--shadow-md);
 }
 
 .sidebarOpen {
@@ -26,7 +30,7 @@
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.25);
+  background: var(--color-overlay);
   z-index: 20;
 }
 
@@ -47,8 +51,8 @@
   width: 38px;
   height: 38px;
   border-radius: var(--radius-md);
-  background: var(--color-accent);
-  color: #ffffff;
+  background: var(--color-highlight);
+  color: var(--color-highlight-ink);
   display: grid;
   place-items: center;
   font-size: 12px;
@@ -64,12 +68,12 @@
 .brandTitle {
   font-size: 14px;
   font-weight: 700;
-  color: var(--color-text);
+  color: #ffffff;
 }
 
 .brandSubtitle {
   font-size: 12px;
-  color: var(--color-muted);
+  color: color-mix(in srgb, #ffffff 68%, transparent);
 }
 
 .nav {
@@ -85,17 +89,48 @@
   border-radius: var(--radius-sm);
   font-size: 13px;
   font-weight: 600;
-  color: var(--color-muted);
+  color: color-mix(in srgb, #ffffff 70%, transparent);
   transition: background 0.15s ease, color 0.15s ease;
 }
 
 .link:hover {
-  background: var(--color-surface-muted);
-  color: var(--color-text);
+  background: color-mix(in srgb, #ffffff 10%, transparent);
+  color: #ffffff;
   text-decoration: none;
 }
 
 .linkActive {
-  background: var(--color-accent-soft);
-  color: var(--color-accent);
+  background: var(--color-highlight);
+  color: var(--color-highlight-ink);
+}
+
+.callout {
+  margin-top: auto;
+  display: grid;
+  gap: 8px;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, #ffffff 8%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 14%, transparent);
+}
+
+.calloutLabel {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-highlight);
+}
+
+.calloutTitle {
+  font-size: 16px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.calloutBody {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: color-mix(in srgb, #ffffff 72%, transparent);
 }

@@ -1,7 +1,7 @@
 # Scoring & Ranking Specification
 
 ### Purpose
-This document defines how YouTube channels are scored and ranked.
+This document defines how YouTube channels in the catalog are scored and ranked.
 The goal is to surface creators who are:
 - active
 - consistently performing
@@ -18,7 +18,7 @@ The goal is to surface creators who are:
 ---
 
 ## 2. Base Metrics
-For each channel, the following metrics are calculated:
+For each stored channel snapshot, the following metrics are calculated:
 
 - avg_views_last_n
 - days_since_last_upload
@@ -94,11 +94,14 @@ Important rule:
 - **Filtering happens BEFORE scoring**
 - Inactive or underperforming channels never receive a score
 
+In the catalog model, filtering is performed on stored channel fields and the latest snapshot is
+then scored and sorted for presentation.
+
 ---
 
 ## 6. Tunability
 All thresholds and weights must be configurable:
-- via config file or request parameters
+- via config, admin controls, or saved segment filters
 - without code changes
 
 ---

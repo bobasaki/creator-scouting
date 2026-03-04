@@ -8,13 +8,13 @@
 }
 
 .success {
-  border-color: #b6e3d8;
+  border-color: var(--color-success-border);
   background: var(--color-success-soft);
   color: var(--color-success);
 }
 
 .error {
-  border-color: #f4c9c7;
+  border-color: var(--color-danger-border);
   background: var(--color-danger-soft);
   color: var(--color-danger);
 }

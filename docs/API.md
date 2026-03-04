@@ -1,71 +1,47 @@
-# API Specification (MVP)
+# API Specification (Catalog Target State)
 
 Base URL:
 /api
 
-This API supports automated YouTube creator scouting runs. It is designed for deterministic,
-reproducible execution and internal use during the MVP phase.
+This API is designed for a continuously refreshed YouTube channel catalog. Users query stored
+channel data. Background workers and internal tools handle discovery, refresh, and enrichment.
+
+`/runs` may continue to exist during migration, but it is a legacy/internal surface rather than
+the primary product workflow. Public clients should use `/channels`. Legacy `/runs` access is
+intended for private-network callers or explicitly authorized internal tooling.
 
 ====================================================================
 
-1. POST /runs
+1. GET /channels
 
 Purpose:
-Start a new scouting run. This endpoint triggers channel discovery, data collection,
-filtering, scoring, and result persistence.
+Query the catalog of scanned channels using stored metrics and inferred metadata.
 
-Request Body (example):
+Typical Query Parameters:
+- country
+- min_country_confidence
+- language
+- min_language_confidence
+- min_subscribers
+- min_avg_views
+- min_engagement_rate
+- max_days_since_upload
+- estimated_category
+- estimated_type
+- email_found
+- sort
+- sort_dir
+- page
+- per_page
+
+Example:
+GET /channels?country=IT&language=it&min_avg_views=10000&estimated_category=Travel&email_found=true
+
+Response (example):
 {
-  "keywords": ["true crime", "mystery", "unsolved"],
-  "region": "DE",
-  "language": "de",
-  "min_avg_views": 8000,
-  "max_days_since_upload": 30,
-  "min_subscribers": 0,
-  "videos_to_analyze": 5,
-  "max_channels": 1000
-}
-
-Request Parameters:
-- keywords (string[])
-  Search terms used to discover relevant channels.
-- region (string, ISO country code)
-  Geographic bias for discovery.
-- language (string, ISO language code)
-  Language bias for discovery.
-- min_avg_views (number)
-  Minimum average views over the last N videos.
-- max_days_since_upload (number)
-  Maximum allowed days since last upload.
-- min_subscribers (number, optional)
-  Optional soft audience size filter.
-- videos_to_analyze (number)
-  Number of recent videos analyzed.
-- max_channels (number)
-  Hard cap to protect YouTube API quotas.
-
-Response:
-{
-  "run_id": "uuid",
-  "status": "completed"
-}
-
-====================================================================
-
-2. GET /runs/{run_id}
-
-Purpose:
-Retrieve full results of a completed scouting run.
-
-Response:
-{
-  "run_id": "uuid",
-  "created_at": "2026-01-21T10:00:00Z",
-  "parameters": {
-    "keywords": ["true crime", "mystery"],
-    "region": "DE",
-    "language": "de"
-  },
+  "page": 1,
+  "per_page": 25,
+  "total": 128,
   "results": [
     {
       "channel_id": "UCxxxx",
@@ -73,67 +49,226 @@ Response:
       "channel_url": "https://youtube.com/channel/UCxxxx",
       "metrics": {
         "subscriber_count": 120000,
+        "min_views_last_n": 9200,
         "avg_views_last_n": 15400,
+        "engagement_rate_last_n": 3.8,
         "days_since_last_upload": 4
       },
-      "scores": {
-        "activity_score": 25,
-        "performance_score": 22,
-        "consistency_score": 18,
-        "audience_size_score": 10,
-        "niche_relevance_score": 8
+      "enrichment": {
+        "estimated_category": "Travel",
+        "estimated_type": "Male",
+        "language_code": "it",
+        "language_detected": "Italian",
+        "language_confidence": "high",
+        "country_inferred": "IT",
+        "country_confidence": "medium"
       },
-      "final_score": 83
+      "contact": {
+        "email": "hello@example.com",
+        "source": "bio"
+      },
+      "freshness": {
+        "last_metrics_refresh_at": "2026-03-01T09:00:00Z",
+        "last_enriched_at": "2026-02-26T11:00:00Z"
+      },
+      "score": {
+        "final_score": 83
+      }
     }
   ]
 }
 
 ====================================================================
 
-3. GET /runs/{run_id}/export
+2. GET /channels/{channel_id}
 
 Purpose:
-Export run results for human review.
+Retrieve full stored detail for a single channel.
 
-Query Parameters:
-- format=csv
-- format=json
-
-Response:
-File download containing channel identifiers, raw metrics, sub-scores, and final scores.
+Response should include:
+- channel identity
+- latest metrics snapshot
+- score breakdown
+- estimated category and type
+- language and country inference
+- contact email and source
+- scanned video sample
+- freshness and provenance metadata
 
 ====================================================================
 
-4. Error Handling
+3. GET /segments
 
-All errors follow a consistent structure:
+Purpose:
+List saved user segments.
+
+Response:
+[
+  {
+    "id": "seg_123",
+    "name": "Italian travel creators",
+    "filters": {
+      "country": "IT",
+      "language": "it",
+      "estimated_category": "Travel",
+      "min_avg_views": 10000
+    },
+    "created_at": "2026-03-01T10:00:00Z",
+    "last_used_at": "2026-03-01T10:05:00Z"
+  }
+]
+
+====================================================================
+
+4. POST /segments
+
+Purpose:
+Create a saved filter preset.
+
+Request Body (example):
+{
+  "name": "German fitness channels",
+  "filters": {
+    "country": "DE",
+    "language": "de",
+    "estimated_category": "Fitness",
+    "min_avg_views": 15000,
+    "email_found": true
+  }
+}
+
+Response:
+{
+  "id": "seg_456",
+  "status": "created"
+}
+
+====================================================================
+
+5. PATCH /segments/{segment_id}
+
+Purpose:
+Update the name or filters of a saved segment.
+
+====================================================================
+
+6. DELETE /segments/{segment_id}
+
+Purpose:
+Delete a saved segment.
+
+====================================================================
+
+7. POST /segments/{segment_id}/use
+
+Purpose:
+Mark a segment as used so the UI can sort and display recent segment activity.
+
+====================================================================
+
+8. Internal/Admin Endpoints
+
+These endpoints are operational and not part of the main end-user workflow.
+
+8.1 GET /admin/discovery/seeds
+- Lists discovery seeds with their current priority, active flag, last outcome, and yield stats
+
+8.2 POST /admin/discovery/seeds
+- Creates a discovery seed using the same core filters as a run input
+
+8.3 PATCH /admin/discovery/seeds/{seed_id}
+- Updates a discovery seed's targeting, active flag, priority, or retry policy
+
+8.4 POST /admin/discovery/bootstrap
+- Creates queued `discover` jobs for active seeds for a given day
+- Reserves quota up front and prevents duplicate seed/day jobs
+
+8.5 POST /admin/refresh/bootstrap
+- Creates queued `refresh_metrics` jobs for stale or explicitly selected catalog channels
+
+8.6 POST /admin/enrich/bootstrap
+- Creates queued `enrich` jobs for stale channels or channels missing enrichment fields
+- `missing_only=true` also backfills missing inferred country/language codes and confidence
+
+8.7 POST /admin/force-refresh
+- Creates queued `force_refresh` jobs for explicitly selected channel IDs
+
+8.8 POST /admin/force-enrich
+- Creates queued `force_enrich` jobs for explicitly selected channel IDs
+
+8.9 POST /admin/jobs/dispatch
+- Claims queued jobs with lock semantics and executes them manually
+- Manual dispatcher executes:
+  - `discover` via the existing `/runs` path
+  - `refresh_metrics` via direct catalog refresh
+  - `enrich` via direct catalog enrichment
+  - `force_refresh` and `force_enrich` if queued internally
+
+8.10 POST /admin/discovery/start
+- One-shot manual daily entry point
+- Bootstraps discovery jobs and immediately dispatches them
+
+8.11 GET /admin/jobs
+- Lists queued, running, succeeded, failed, and dead-letter jobs
+
+8.12 GET /admin/quota
+- Returns current quota budget, used units, and reserved units
+
+8.13 GET /admin/catalog/coverage
+- Returns aggregate catalog coverage by inferred country, language, and estimated category
+
+8.14 GET /admin/catalog/stale
+- Returns stale refresh and stale enrichment candidate lists from the catalog
+
+8.15 GET /admin/workers/health
+- Returns queue totals, per-job-type status counts, stuck running jobs, and auto-scheduler config flags
+
+====================================================================
+
+8. Freshness Design
+
+Every catalog response should expose freshness fields such as:
+- first_seen_at
+- last_seen_at
+- last_metrics_refresh_at
+- last_content_refresh_at
+- last_enriched_at
+
+Users are filtering a living catalog, so freshness is a first-class property of the API.
+
+====================================================================
+
+9. Error Handling
+
+All errors should follow a consistent structure:
 {
   "error": "Quota exceeded",
   "code": "YOUTUBE_QUOTA_LIMIT"
 }
 
-====================================================================
-
-5. Authentication (MVP)
-
-No authentication is required.
-The API is assumed to be internal and environment-protected.
-
-====================================================================
-
-6. Rate Limiting & Safety
-
-- Hard limits enforced per run
-- Quota exhaustion must fail gracefully
-- Partial results may be returned if available
-- No retries that risk runaway quota usage
+Possible error classes:
+- invalid filters
+- unsupported sort field
+- quota exhausted for internal scan requests
+- resource not found
+- worker queue unavailable
 
 ====================================================================
 
-7. Design Principles
+10. Authentication
 
-- Deterministic outputs
-- Reproducible runs
-- Transparent scoring
-- Human-review-first design
-- No mandatory LLM dependency at API level
+End-user catalog endpoints should require application authentication once the product leaves
+internal-only usage.
+
+Internal/admin endpoints should require stronger access controls than catalog read endpoints.
+
+====================================================================
+
+11. Design Principles
+
+- Users query the database, not YouTube
+- Discovery is continuous and quota-budgeted
+- Refresh is prioritized over repeated rediscovery
+- Enrichment is incremental and freshness-aware
+- Scores must be explainable
+- Country must be treated as inferred, not absolute truth

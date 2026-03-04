@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import {
@@ -18,15 +19,21 @@ import { Button } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader } from "@/components/ui/Card";
 import { Container } from "@/components/ui/Container";
 import { useToast } from "@/components/ui/Toast";
+import { RUNS_UI_ENABLED } from "@/lib/features";
 import styles from "./RunsPage.module.css";
 
 export default function RunsPage() {
   const router = useRouter();
-  const [keywords, setKeywords] = useState("");
-  const [region, setRegion] = useState("DE");
-  const [language, setLanguage] = useState("de");
-  const [maxChannels, setMaxChannels] = useState(10);
-  const [videosToAnalyze, setVideosToAnalyze] = useState(3);
+  const [keywords, setKeywords] = useState<string[]>([]);
+  const [excludeKeywords, setExcludeKeywords] = useState<string[]>([]);
+  const [region, setRegion] = useState("");
+  const [language, setLanguage] = useState("");
+  const [maxChannels, setMaxChannels] = useState("");
+  const [videosToAnalyze, setVideosToAnalyze] = useState("");
+  const [minViews, setMinViews] = useState("");
+  const [maxDaysSinceUpload, setMaxDaysSinceUpload] = useState("");
+  const [minAvgViews, setMinAvgViews] = useState("");
+  const [minEngagementRate, setMinEngagementRate] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [recentRunId, setRecentRunId] = useState<string | null>(null);
@@ -38,6 +45,30 @@ export default function RunsPage() {
   const { toast } = useToast();
 
   const apiBaseUrl = getApiBaseUrl();
+
+  function normalizeRegion(value: string) {
+    return value.trim().toUpperCase().slice(0, 2);
+  }
+
+  function normalizeLanguage(value: string) {
+    return value.trim().replace(/_/g, "-").toLowerCase().slice(0, 5);
+  }
+
+  function parseOptionalInteger(value: string) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return undefined;
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return undefined;
+    return Math.trunc(parsed);
+  }
+
+  function parseOptionalNumber(value: string) {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) return undefined;
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return undefined;
+    return parsed;
+  }
 
   function formatRunsError(err: unknown): string {
     if (err && typeof err === "object") {
@@ -69,6 +100,7 @@ export default function RunsPage() {
   }
 
   useEffect(() => {
+    if (!RUNS_UI_ENABLED) return;
     loadRuns();
   }, []);
 
@@ -78,14 +110,16 @@ export default function RunsPage() {
     setCreateError(null);
 
     const input: RunRequest = {
-      keywords: keywords
-        .split(",")
-        .map((value) => value.trim())
-        .filter(Boolean),
-      region,
-      language,
-      max_channels: Number(maxChannels),
-      videos_to_analyze: Number(videosToAnalyze),
+      keywords,
+      exclude_keywords: excludeKeywords,
+      region: normalizeRegion(region),
+      language: normalizeLanguage(language),
+      max_channels: parseOptionalInteger(maxChannels),
+      videos_to_analyze: parseOptionalInteger(videosToAnalyze),
+      min_views: parseOptionalInteger(minViews),
+      max_days_since_upload: parseOptionalInteger(maxDaysSinceUpload),
+      min_avg_views: parseOptionalInteger(minAvgViews),
+      min_engagement_rate: parseOptionalNumber(minEngagementRate),
     };
 
     try {
@@ -155,6 +189,27 @@ export default function RunsPage() {
     }
   }
 
+  if (!RUNS_UI_ENABLED) {
+    return (
+      <Container className={styles.page}>
+        <div className={styles.header}>
+          <h1 className={styles.title}>Internal runs</h1>
+          <p className={styles.subtitle}>
+            The run-first UI is now restricted to internal debugging and admin workflows.
+          </p>
+        </div>
+        <Card>
+          <CardHeader>Catalog-first workflow</CardHeader>
+          <CardContent>
+            Use the channel catalog at <Link href="/channels">/channels</Link> for normal
+            scouting. Re-enable the runs UI only for internal use with
+            `NEXT_PUBLIC_ENABLE_RUNS_UI=true`.
+          </CardContent>
+        </Card>
+      </Container>
+    );
+  }
+
   return (
     <Container className={styles.page}>
       <div className={styles.header}>
@@ -168,17 +223,27 @@ export default function RunsPage() {
         <CardContent>
           <RunForm
             keywords={keywords}
+            excludeKeywords={excludeKeywords}
             region={region}
             language={language}
             maxChannels={maxChannels}
             videosToAnalyze={videosToAnalyze}
+            minViews={minViews}
+            maxDaysSinceUpload={maxDaysSinceUpload}
+            minAvgViews={minAvgViews}
+            minEngagementRate={minEngagementRate}
             submitting={submitting}
             error={createError}
             onKeywordsChange={setKeywords}
-            onRegionChange={setRegion}
-            onLanguageChange={setLanguage}
+            onExcludeKeywordsChange={setExcludeKeywords}
+            onRegionChange={(value) => setRegion(normalizeRegion(value))}
+            onLanguageChange={(value) => setLanguage(normalizeLanguage(value))}
             onMaxChannelsChange={setMaxChannels}
             onVideosToAnalyzeChange={setVideosToAnalyze}
+            onMinViewsChange={setMinViews}
+            onMaxDaysSinceUploadChange={setMaxDaysSinceUpload}
+            onMinAvgViewsChange={setMinAvgViews}
+            onMinEngagementRateChange={setMinEngagementRate}
             onSubmit={handleSubmit}
           />
           {submitting ? <InlineStatus label="Creating run..." /> : null}
@@ -187,16 +252,16 @@ export default function RunsPage() {
       {recentRunId ? (
         <div className={styles.recentNote}>
           Recent run:{" "}
-          <a className={styles.inlineLink} href={`/runs/${recentRunId}`}>
+          <Link className={styles.inlineLink} href={`/runs/${recentRunId}`}>
             {recentRunId}
-          </a>
+          </Link>
         </div>
       ) : null}
       <Card className={styles.statusCard}>
         <CardContent>
           <div className={styles.statusRow}>
             <div>
-              API status: <span className={styles.statusValue}>{apiBaseUrl}</span>
+              API proxy: <span className={styles.statusValue}>{apiBaseUrl}</span>
             </div>
             <Button
               type="button"

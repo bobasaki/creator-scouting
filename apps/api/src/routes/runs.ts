@@ -1,33 +1,90 @@
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { randomUUID } from "node:crypto";
 
 import { RunRequestSchema } from "../schemas/run.schema";
 
-import { scoreChannel } from "../domain/score";
-import { passesFilters } from "../domain/filter";
-
 import {
   markPending,
   saveSuccess,
+  saveFailure,
+  type CachedYouTubeContext,
   getEnrichmentsForRun
 } from "../repositories/enrichment.repo";
 
-import {
-  searchChannelsByKeyword,
-  getChannelDetails,
-  getRecentVideos,
-  getChannelText
-} from "../integrations/youtube/client";
+import { getChannelDetails, getRecentVideos } from "../integrations/youtube/client";
 import { ExternalApiError } from "../errors/externalApiError";
-import { mapYoutubeToChannelMetrics } from "../integrations/youtube/mapper";
 
 import { enrichChannel } from "../integrations/llm/openai";
 
-import {
-  createRunWithResults,
-  getRunById,
-  listRecentRuns
-} from "../repositories/runs.repo";
+import { getRunById, listRecentRuns } from "../repositories/runs.repo";
+import { applyCatalogChannelEnrichment } from "../repositories/catalog.repo";
+import { executeRunRequest } from "../services/run-execution";
+
+function parseBooleanEnv(name: string, fallback: boolean) {
+  const value = process.env[name];
+  if (value === undefined) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizeRemoteAddress(value: string | undefined) {
+  if (!value) return "";
+  const trimmed = value.trim();
+  return trimmed.startsWith("::ffff:") ? trimmed.slice(7) : trimmed;
+}
+
+function isPrivateNetworkAddress(value: string | undefined) {
+  const normalized = normalizeRemoteAddress(value);
+  if (!normalized) return false;
+
+  if (normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost") {
+    return true;
+  }
+
+  if (normalized.startsWith("10.") || normalized.startsWith("192.168.")) {
+    return true;
+  }
+
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(normalized)) {
+    return true;
+  }
+
+  return false;
+}
+
+function hasValidRunsInternalToken(request: FastifyRequest) {
+  const configured = process.env.RUNS_API_INTERNAL_TOKEN?.trim();
+  if (!configured) return false;
+
+  const header = request.headers["x-runs-internal-token"];
+  const provided = Array.isArray(header) ? header[0] : header;
+  return typeof provided === "string" && provided.trim() === configured;
+}
+
+async function ensureRunsAccess(request: FastifyRequest, reply: FastifyReply) {
+  if (parseBooleanEnv("RUNS_API_PUBLIC_ENABLED", false)) {
+    return true;
+  }
+
+  if (hasValidRunsInternalToken(request)) {
+    return true;
+  }
+
+  const remoteAddress =
+    request.ip || request.socket?.remoteAddress || request.raw.socket?.remoteAddress;
+  if (isPrivateNetworkAddress(remoteAddress)) {
+    return true;
+  }
+
+  await reply.status(403).send({
+    error: "RUNS_API_FORBIDDEN",
+    message:
+      "Legacy /runs endpoints are internal-only. Use /channels for the public catalog workflow."
+  });
+  return false;
+}
 
 /**
  * 10.2 helpers: retry + concurrency pool
@@ -117,6 +174,30 @@ type SponsorshipScan = {
   evidence: SponsorshipEvidence[];
 };
 
+type ContactEmailSource = "bio" | "video_description";
+
+type ContactEmailMatch = {
+  email: string;
+  source: ContactEmailSource;
+  videoId?: string;
+  videoTitle?: string;
+  videoIndex?: number;
+};
+
+type ScanContextView = {
+  contact_email: {
+    email: string;
+    source: ContactEmailSource;
+    video_id: string | null;
+    video_title: string | null;
+  } | null;
+  videos_scanned: Array<{
+    video_id: string | null;
+    title: string | null;
+    email_found: boolean;
+  }>;
+};
+
 const SPONSORSHIP_PATTERNS: RegExp[] = [
   // EN
   /\b(sponsored|sponsor|paid partnership)\b/i,
@@ -180,6 +261,128 @@ function detectSponsorships(input: {
     ratio >= 0.4 ? "high" : ratio >= 0.15 ? "medium" : sponsoredCount > 0 ? "low" : "low";
 
   return { nVideos: n, sponsoredCount, ratio, confidence, evidence };
+}
+
+function normalizeEmailCandidate(value: string): string {
+  return value
+    .trim()
+    .replace(/^[<(\["']+/, "")
+    .replace(/[>),\]"';:.!?]+$/, "")
+    .toLowerCase();
+}
+
+function extractEmailFromText(value: string): string | null {
+  if (value.trim().length === 0) return null;
+
+  const matches = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? [];
+  for (const match of matches) {
+    const normalized = normalizeEmailCandidate(match);
+    if (/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(normalized)) {
+      return normalized;
+    }
+  }
+
+  return null;
+}
+
+function findContactEmail(input: CachedYouTubeContext): ContactEmailMatch | null {
+  const bioEmail = extractEmailFromText(input.description);
+  if (bioEmail) {
+    return { email: bioEmail, source: "bio" };
+  }
+
+  const n = Math.max(input.videoIds.length, input.titles.length, input.descriptions.length);
+  for (let i = 0; i < n; i++) {
+    const description = input.descriptions[i] ?? "";
+    const videoEmail = extractEmailFromText(description);
+    if (!videoEmail) continue;
+
+    return {
+      email: videoEmail,
+      source: "video_description",
+      videoId: input.videoIds[i] ?? undefined,
+      videoTitle: input.titles[i] ?? undefined,
+      videoIndex: i
+    };
+  }
+
+  return null;
+}
+
+function buildScanContext(context: CachedYouTubeContext | null): ScanContextView | null {
+  if (!context) return null;
+
+  const contactEmail = findContactEmail(context);
+  const n = Math.max(context.videoIds.length, context.titles.length, context.descriptions.length);
+  const videosScanned: ScanContextView["videos_scanned"] = [];
+
+  for (let i = 0; i < n; i++) {
+    const videoId = context.videoIds[i] ?? "";
+    const title = context.titles[i] ?? "";
+
+    if (videoId.length === 0 && title.length === 0) continue;
+
+    videosScanned.push({
+      video_id: videoId || null,
+      title: title || null,
+      email_found:
+        contactEmail?.source === "video_description" && contactEmail.videoIndex === i
+    });
+  }
+
+  if (!contactEmail && videosScanned.length === 0) return null;
+
+  return {
+    contact_email: contactEmail
+      ? {
+          email: contactEmail.email,
+          source: contactEmail.source,
+          video_id: contactEmail.videoId ?? null,
+          video_title: contactEmail.videoTitle ?? null
+        }
+      : null,
+    videos_scanned: videosScanned
+  };
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string");
+}
+
+function getCachedYoutubeContext(row: any): CachedYouTubeContext | null {
+  const context = row?.raw?.youtubeContext;
+  if (!context || typeof context !== "object") return null;
+
+  const description = typeof context.description === "string" ? context.description : "";
+  const recentTitles = toStringArray(context.recentTitles);
+  const videoIds = toStringArray(context.videoIds);
+  const titles = toStringArray(context.titles);
+  const descriptions = toStringArray(context.descriptions);
+
+  if (
+    description.length === 0 &&
+    recentTitles.length === 0 &&
+    videoIds.length === 0 &&
+    titles.length === 0 &&
+    descriptions.length === 0
+  ) {
+    return null;
+  }
+
+  return {
+    description,
+    recentTitles,
+    videoIds,
+    titles,
+    descriptions
+  };
+}
+
+function truncateText(value: string, maxChars: number): string {
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
 }
 
 // Step 10.4: job registry + runner helper
@@ -285,6 +488,14 @@ async function runEnrichmentJob(args: {
   );
 
   let failed = 0;
+  const promptDescriptionMaxChars = Math.max(
+    300,
+    Math.min(Number(process.env.ENRICH_DESCRIPTION_MAX_CHARS ?? 1200), 4000)
+  );
+  const promptTitleMaxChars = Math.max(
+    40,
+    Math.min(Number(process.env.ENRICH_TITLE_MAX_CHARS ?? 140), 300)
+  );
 
   const outcomes = await runPool(toProcess, concurrency, async (r) => {
     // Step 10.5: stop quickly if job has been marked failed/done (e.g., timeout)
@@ -294,6 +505,7 @@ async function runEnrichmentJob(args: {
     }
 
     const channelId = r.channelId;
+    let youtubeContext: CachedYouTubeContext | null = null;
 
     try {
       // 1) Claim pending (Step 10.7: prevent duplicate spend)
@@ -302,20 +514,70 @@ async function runEnrichmentJob(args: {
         return "skipped" as const;
       }
 
-      // 2) Fetch YouTube text
-      const { description, recentTitles } = await getChannelText(channelId, 5);
+      let description = "";
+      let recentTitles: string[] = [];
+      let sponsorship: ReturnType<typeof detectSponsorships> | null = null;
 
-      // 2b) Fetch recent videos (title/description) for sponsorship detection
-      const scanN = Math.max(
-        1,
-        Math.min(Number(process.env.SPONSORSHIP_SCAN_N ?? 10), 25)
+      const cachedContext = getCachedYoutubeContext(existingByChannelId.get(channelId));
+      if (cachedContext) {
+        description = cachedContext.description;
+        recentTitles = cachedContext.recentTitles;
+        sponsorship = detectSponsorships({
+          videoIds: cachedContext.videoIds,
+          titles: cachedContext.titles,
+          descriptions: cachedContext.descriptions
+        });
+        youtubeContext = cachedContext;
+      } else {
+        // 2) Fetch YouTube context. If quota is exceeded, continue with metrics-only enrichment.
+        try {
+          const [channel] = await getChannelDetails([channelId]);
+          description = channel?.description ?? "";
+
+          // 2b) Fetch recent videos (title/description) for sponsorship detection
+          const scanN = Math.max(
+            1,
+            Math.min(Number(process.env.SPONSORSHIP_SCAN_N ?? 10), 25)
+          );
+          const recent = await getRecentVideos(
+            channelId,
+            scanN,
+            channel?.uploadsPlaylistId ?? undefined
+          );
+          recentTitles = toStringArray(recent.titles).slice(0, 5);
+          sponsorship = detectSponsorships({
+            videoIds: recent.videoIds ?? [],
+            titles: recent.titles ?? [],
+            descriptions: recent.descriptions ?? []
+          });
+          youtubeContext = {
+            description,
+            recentTitles,
+            videoIds: toStringArray(recent.videoIds),
+            titles: toStringArray(recent.titles),
+            descriptions: toStringArray(recent.descriptions)
+          };
+        } catch (err: unknown) {
+          const isYouTubeQuotaExceeded =
+            err instanceof ExternalApiError && err.code === "YOUTUBE_QUOTA_EXCEEDED";
+          if (!isYouTubeQuotaExceeded) {
+            throw err;
+          }
+          log.warn(
+            { runId, channelId, err: err instanceof Error ? err.message : String(err) },
+            "ENRICH continuing without YouTube context due to quota"
+          );
+        }
+      }
+
+      const promptDescription = truncateText(
+        description || "(no description)",
+        promptDescriptionMaxChars
       );
-      const recent = await getRecentVideos(channelId, scanN);
-      const sponsorship = detectSponsorships({
-        videoIds: recent.videoIds ?? [],
-        titles: recent.titles ?? [],
-        descriptions: recent.descriptions ?? []
-      });
+      const promptTitles = recentTitles
+        .slice(0, 5)
+        .map((t) => truncateText(t, promptTitleMaxChars))
+        .filter((t) => t.length > 0);
 
       // 3) Build prompt input
       const inputText = `
@@ -325,17 +587,21 @@ Average views (last N): ${r.avgViewsLastN}
 Days since last upload: ${r.daysSinceLastUpload}
 
 Channel description:
-${description || "(no description)"}
+${promptDescription}
 
 Recent video titles:
 ${
-  recentTitles.length
-    ? recentTitles.map((t) => `- ${t}`).join("\n")
+  promptTitles.length
+    ? promptTitles.map((t) => `- ${t}`).join("\n")
     : "(no recent titles)"
 }
 
+Discovery hints:
+- Region seed: ${found.run.region ?? "unknown"}
+- Language seed: ${found.run.language ?? "unknown"}
+
 Task:
-Classify this channel for influencer scouting.
+Classify this channel for influencer scouting. Use discovery hints only when the content is ambiguous.
       `.trim();
 
       // 4) Call LLM with retry/backoff (transient failures only)
@@ -356,15 +622,46 @@ Classify this channel for influencer scouting.
         payload: {
           model,
           status: "success",
+          estimatedCategory: enrichment.estimated_category,
+          estimatedType: enrichment.estimated_type,
           nicheLabels: enrichment.niche_labels,
           languageDetected: enrichment.language_detected,
           fitSummary: enrichment.fit_summary,
           brandSafetyNotes: enrichment.brand_safety_notes,
           redFlags: enrichment.red_flags,
           sponsorship,
-          raw: { ...enrichment, sponsorship }
+          raw: {
+            ...enrichment,
+            sponsorship,
+            ...(youtubeContext ? { youtubeContext } : {})
+          }
         }
       });
+
+      try {
+        await applyCatalogChannelEnrichment({
+          channelId,
+          estimatedCategory: enrichment.estimated_category,
+          estimatedType: enrichment.estimated_type,
+          countryInferred: enrichment.country_inferred,
+          countryConfidence: enrichment.country_confidence,
+          languageCode: enrichment.language_code,
+          languageDetected: enrichment.language_detected,
+          languageConfidence: enrichment.language_confidence
+        });
+      } catch (catalogErr) {
+        log.warn(
+          {
+            runId,
+            channelId,
+            err:
+              catalogErr instanceof Error
+                ? catalogErr.message
+                : String(catalogErr)
+          },
+          "Failed to sync catalog enrichment"
+        );
+      }
 
       return "success" as const;
     } catch (err) {
@@ -380,6 +677,14 @@ Classify this channel for influencer scouting.
         typeof rawMsg === "string" && rawMsg.trim().length > 0
           ? rawMsg
           : "One or more channels failed enrichment (see logs)";
+
+      await saveFailure({
+        runId,
+        channelId,
+        model,
+        error: { message: msg },
+        youtubeContext
+      });
 
       const job = enrichJobs.get(runId);
       if (job && (!job.lastError || String(job.lastError).trim() === "")) {
@@ -489,6 +794,8 @@ function buildRunResultView(args: {
   includeEnrichment: boolean;
 }) {
   const { runResult: r, enrichmentRow: e, includeEnrichment } = args;
+  const youtubeContext = getCachedYoutubeContext(e);
+  const scanContext = buildScanContext(youtubeContext);
 
   const baseScore = Number(r.finalScore ?? 0);
   let delta = 0;
@@ -501,8 +808,20 @@ function buildRunResultView(args: {
       const s = e.sponsorship ?? e.raw?.sponsorship ?? null;
 
       const payload = {
+        estimatedCategory:
+          typeof e?.raw?.estimated_category === "string" ? e.raw.estimated_category : null,
+        estimatedType:
+          typeof e?.raw?.estimated_type === "string" ? e.raw.estimated_type : null,
+        countryInferred:
+          typeof e?.raw?.country_inferred === "string" ? e.raw.country_inferred : null,
+        countryConfidence:
+          typeof e?.raw?.country_confidence === "string" ? e.raw.country_confidence : null,
+        languageCode:
+          typeof e?.raw?.language_code === "string" ? e.raw.language_code : null,
         nicheLabels: e.nicheLabels ?? null,
         languageDetected: e.languageDetected ?? null,
+        languageConfidence:
+          typeof e?.raw?.language_confidence === "string" ? e.raw.language_confidence : null,
         fitSummary: e.fitSummary ?? null,
         brandSafetyNotes: e.brandSafetyNotes ?? null,
         redFlags: e.redFlags ?? null,
@@ -557,6 +876,7 @@ function buildRunResultView(args: {
     finalScore: baseScore + delta,
     why,
     deltaComponents,
+    scan_context: scanContext,
     enrichment: enrichmentOut,
     score_breakdown: scoreBreakdown,
     score_version: "11.8"
@@ -564,9 +884,15 @@ function buildRunResultView(args: {
 }
 
 export async function runsRoutes(app: FastifyInstance) {
-  // DEBUG: confirms which runs.ts is currently running
-  app.get("/debug/version", async () => {
-    return { runs_ts: "10.8-cleanup", ts: new Date().toISOString() };
+  app.addHook("preHandler", async (request, reply) => {
+    if (!request.url.startsWith("/runs")) {
+      return;
+    }
+
+    const allowed = await ensureRunsAccess(request, reply);
+    if (!allowed) {
+      return reply;
+    }
   });
 
   // GET /runs/:runId/enrich/job
@@ -591,38 +917,40 @@ export async function runsRoutes(app: FastifyInstance) {
       let failed = 0;
       let pending = 0;
       let other = 0;
+      let firstFailedMessage: string | null = null;
 
       for (const e of enrichments as any[]) {
         const s = String((e as any).status ?? "").toLowerCase();
         if (s === "success") success++;
         else if (s === "failed") {
           failed++;
-          const row = e as any;
-          const msgCandidates = [
-            row?.error?.message,
-            row?.error,
-            row?.message,
-            row?.reason,
-            row?.details,
-            row?.raw?.error?.message,
-            row?.raw?.error,
-            row?.raw?.message,
-            row?.raw?.reason,
-            row?.raw?.details
-          ];
-          const msg =
-            msgCandidates
-              .map((v) =>
-                typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
-              )
-              .find((v) => v.trim().length > 0) ??
-            "One or more channels failed enrichment (see logs)";
-          if (!(job as any).lastError || String((job as any).lastError).trim() === "") {
-            (job as any).lastError = msg;
+          if (!firstFailedMessage) {
+            const row = e as any;
+            const msgCandidates = [
+              row?.error,
+              row?.raw?.error?.message,
+              row?.raw?.error,
+              row?.message,
+              row?.reason,
+              row?.details,
+              row?.raw?.message,
+              row?.raw?.reason,
+              row?.raw?.details
+            ];
+            firstFailedMessage =
+              msgCandidates
+                .map((v) =>
+                  typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
+                )
+                .find((v) => v.trim().length > 0) ?? null;
           }
-        }
-        else if (s === "pending") pending++;
+        } else if (s === "pending") pending++;
         else other++;
+      }
+
+      if (failed > 0 && (!(job as any).lastError || String((job as any).lastError).trim() === "")) {
+        (job as any).lastError =
+          firstFailedMessage ?? "One or more channels failed enrichment (see logs)";
       }
 
       const missing = Math.max(0, total - (success + failed + pending + other));
@@ -652,96 +980,7 @@ export async function runsRoutes(app: FastifyInstance) {
     const validatedInput = parseResult.data;
 
     try {
-      const {
-        keywords,
-        region,
-        language,
-        min_avg_views,
-        max_days_since_upload,
-        min_subscribers,
-        videos_to_analyze = 5,
-        max_channels = 25
-      } = validatedInput as any;
-
-      // Safety caps (quota protection)
-      const safeMaxChannels = Math.max(1, Math.min(Number(max_channels) || 25, 50));
-      const safeVideosToAnalyze = Math.max(
-        1,
-        Math.min(Number(videos_to_analyze) || 5, 10)
-      );
-
-      // 1) Discover channels across keywords
-      const discovered: { channelId: string }[] = [];
-      for (const keyword of keywords as string[]) {
-        const found = await searchChannelsByKeyword(
-          keyword,
-          safeMaxChannels,
-          region,
-          language
-        );
-        discovered.push(...found);
-      }
-
-      // 2) Deduplicate + cap
-      const uniqueChannelIds = Array.from(new Set(discovered.map((c) => c.channelId))).slice(
-        0,
-        safeMaxChannels
-      );
-
-      // 3) Fetch channel details
-      const details = await getChannelDetails(uniqueChannelIds);
-
-      // 4) Fetch videos per channel, map → filter → score
-      const results: any[] = [];
-      for (const ch of details as any[]) {
-        const channelId = ch.channelId;
-
-        const videoData = await getRecentVideos(channelId, safeVideosToAnalyze);
-
-        const metrics = mapYoutubeToChannelMetrics({
-          channelId,
-          channelName: ch.channelName ?? ch.title ?? ch.name ?? channelId,
-          channelUrl: ch.channelUrl ?? `https://youtube.com/channel/${channelId}`,
-          subscriberCount: Number(ch.subscriberCount ?? 0),
-          recentViews: videoData.views ?? [],
-          daysSinceLastUpload: Number(videoData.daysSinceLastUpload ?? 9999)
-        });
-
-        const passes = passesFilters(metrics, {
-          minAvgViews: min_avg_views,
-          maxDaysSinceUpload: max_days_since_upload,
-          minSubscribers: min_subscribers
-        });
-
-        if (!passes) continue;
-
-        results.push(scoreChannel(metrics));
-      }
-
-      // 5) Sort
-      results.sort((a: any, b: any) => b.finalScore - a.finalScore);
-
-      // 6) Persist run + results
-      const runId = randomUUID();
-
-      await createRunWithResults({
-        runId,
-        input: validatedInput as any,
-        results
-      });
-
-      // 7) Read back the persisted run for DB truth (createdAt)
-      const persisted = await getRunById(runId);
-      const createdAt = persisted?.run?.createdAt
-        ? new Date(persisted.run.createdAt).toISOString()
-        : new Date().toISOString(); // fallback should never happen
-
-      // 8) Return response
-      return {
-        run_id: runId,
-        created_at: createdAt,
-        results
-      };
+      return await executeRunRequest(validatedInput, request.log);
     } catch (err: any) {
       request.log.error({ err }, "POST /runs failed");
       if (err instanceof ExternalApiError) {
@@ -774,10 +1013,15 @@ export async function runsRoutes(app: FastifyInstance) {
       created_at: new Date(run.createdAt).toISOString(),
       input: {
         keywords: run.keywords ?? [],
+        exclude_keywords: run.excludeKeywords ?? [],
         region: run.region,
         language: run.language,
         max_channels: run.maxChannels ?? null,
-        videos_to_analyze: run.videosToAnalyze ?? null
+        videos_to_analyze: run.videosToAnalyze ?? null,
+        min_views: run.minViews ?? null,
+        min_avg_views: run.minAvgViews ?? null,
+        max_days_since_upload: run.maxDaysSinceUpload ?? null,
+        min_engagement_rate: run.minEngagementRate ?? null
       }
     }));
   });
@@ -977,14 +1221,16 @@ export async function runsRoutes(app: FastifyInstance) {
 
       input: {
         keywords: found.run.keywords,
+        exclude_keywords: found.run.excludeKeywords ?? [],
         region: found.run.region,
         language: found.run.language,
 
         max_channels: found.run.maxChannels ?? undefined,
         videos_to_analyze: found.run.videosToAnalyze ?? undefined,
-
+        min_views: found.run.minViews ?? undefined,
         min_avg_views: found.run.minAvgViews ?? undefined,
-        max_days_since_upload: found.run.maxDaysSinceLastUpload ?? undefined,
+        max_days_since_upload: found.run.maxDaysSinceUpload ?? undefined,
+        min_engagement_rate: found.run.minEngagementRate ?? undefined,
         min_subscribers: found.run.minSubscribers ?? undefined
       },
 
@@ -1025,12 +1271,15 @@ export async function runsRoutes(app: FastifyInstance) {
         created_at: new Date(found.run.createdAt).toISOString(),
         input: {
           keywords: found.run.keywords,
+          exclude_keywords: found.run.excludeKeywords ?? [],
           region: found.run.region,
           language: found.run.language,
           max_channels: found.run.maxChannels ?? undefined,
           videos_to_analyze: found.run.videosToAnalyze ?? undefined,
+          min_views: found.run.minViews ?? undefined,
           min_avg_views: found.run.minAvgViews ?? undefined,
-          max_days_since_upload: found.run.maxDaysSinceLastUpload ?? undefined,
+          max_days_since_upload: found.run.maxDaysSinceUpload ?? undefined,
+          min_engagement_rate: found.run.minEngagementRate ?? undefined,
           min_subscribers: found.run.minSubscribers ?? undefined
         },
         results: resultsJson
@@ -1123,7 +1372,7 @@ export async function runsRoutes(app: FastifyInstance) {
         "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,score_version\n";
 
       const headerExtended =
-        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,final_score_base,final_score_delta,final_score_final,has_brand_ads_last_n,brand_ads_confidence,sponsorship_ratio,why,sponsor_evidence,score_version\n";
+        "channel_id,channel_name,channel_url,subscriber_count,avg_views_last_n,days_since_last_upload,final_score,final_score_base,final_score_delta,final_score_final,estimated_category,estimated_type,has_brand_ads_last_n,brand_ads_confidence,sponsorship_ratio,why,sponsor_evidence,contact_email,email_source,email_video_id,email_video_title,videos_scanned,score_version\n";
 
       const header = includeEnrichment ? headerExtended : headerBase;
 
@@ -1163,6 +1412,18 @@ export async function runsRoutes(app: FastifyInstance) {
               .join(" | ");
           }
 
+          const videosScanned = Array.isArray(view.scan_context?.videos_scanned)
+            ? view.scan_context.videos_scanned
+                .map((video: any) => {
+                  const title = typeof video?.title === "string" ? video.title : "";
+                  const videoId = typeof video?.video_id === "string" ? video.video_id : "";
+                  const suffix = video?.email_found ? " [email]" : "";
+                  return title || videoId ? `${title || videoId}${suffix}` : "";
+                })
+                .filter((value: string) => value.length > 0)
+                .join(" | ")
+            : "";
+
           return [
             esc(view.metrics.channelId),
             esc(view.metrics.channelName),
@@ -1175,6 +1436,8 @@ export async function runsRoutes(app: FastifyInstance) {
             view.finalScoreBase,
             view.finalScoreDelta,
             view.finalScoreFinal,
+            esc(view.enrichment?.payload?.estimatedCategory ?? ""),
+            esc(view.enrichment?.payload?.estimatedType ?? ""),
 
             esc(
               view.enrichment?.payload?.hasBrandAdsLastN === null
@@ -1190,6 +1453,11 @@ export async function runsRoutes(app: FastifyInstance) {
             ),
             esc(Array.isArray(view.why) ? view.why.join("; ") : ""),
             esc(sponsorEvidence),
+            esc(view.scan_context?.contact_email?.email ?? ""),
+            esc(view.scan_context?.contact_email?.source ?? ""),
+            esc(view.scan_context?.contact_email?.video_id ?? ""),
+            esc(view.scan_context?.contact_email?.video_title ?? ""),
+            esc(videosScanned),
             esc("11.8")
           ].join(",");
         })
@@ -1224,38 +1492,39 @@ export async function runsRoutes(app: FastifyInstance) {
     let pending = 0;
     let other = 0;
     const job = enrichJobs.get(runId);
+    let firstFailedMessage: string | null = null;
 
     for (const e of enrichments as any[]) {
       const s = String((e as any).status ?? "").toLowerCase();
       if (s === "success") success++;
       else if (s === "failed") {
         failed++;
-        const row = e as any;
-        const msgCandidates = [
-          row?.error?.message,
-          row?.error,
-          row?.message,
-          row?.reason,
-          row?.details,
-          row?.raw?.error?.message,
-          row?.raw?.error,
-          row?.raw?.message,
-          row?.raw?.reason,
-          row?.raw?.details
-        ];
-        const msg =
-          msgCandidates
-            .map((v) =>
-              typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
-            )
-            .find((v) => v.trim().length > 0) ??
-          "One or more channels failed enrichment (see logs)";
-        if (job && (!job.lastError || String(job.lastError).trim() === "")) {
-          job.lastError = msg;
+        if (!firstFailedMessage) {
+          const row = e as any;
+          const msgCandidates = [
+            row?.error,
+            row?.raw?.error?.message,
+            row?.raw?.error,
+            row?.message,
+            row?.reason,
+            row?.details,
+            row?.raw?.message,
+            row?.raw?.reason,
+            row?.raw?.details
+          ];
+          firstFailedMessage =
+            msgCandidates
+              .map((v) =>
+                typeof v === "string" ? v : v !== null && v !== undefined ? JSON.stringify(v) : ""
+              )
+              .find((v) => v.trim().length > 0) ?? null;
         }
-      }
-      else if (s === "pending") pending++;
+      } else if (s === "pending") pending++;
       else other++;
+    }
+
+    if (job && failed > 0 && (!job.lastError || String(job.lastError).trim() === "")) {
+      job.lastError = firstFailedMessage ?? "One or more channels failed enrichment (see logs)";
     }
 
     const missing = Math.max(0, total - (success + failed + pending + other));

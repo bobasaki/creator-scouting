@@ -1,36 +1,63 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# UI
 
-## Getting Started
+The UI is a Next.js app that proxies backend requests through the same origin.
 
-First, run the development server:
+## How it works
+
+- The browser calls relative paths under `/backend`.
+- Next.js rewrites `/backend/:path*` to `BACKEND_URL/:path*`.
+- `BACKEND_URL` is server-side only, so the browser never needs to know the API host.
+
+This means the UI works the same way when you open it from:
+
+- `localhost`
+- another device on your LAN
+- a deployed server
+
+## Environment
+
+Set `BACKEND_URL` for the machine running the UI server.
+
+Example for local development:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+BACKEND_URL=http://127.0.0.1:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Example when both services run on the same server:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+BACKEND_URL=http://127.0.0.1:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Example when the UI must reach the API on another host:
 
-## Learn More
+```bash
+BACKEND_URL=http://api.internal:3000
+```
 
-To learn more about Next.js, take a look at the following resources:
+If you open the Next dev server from another device, add that UI origin to `DEV_ALLOWED_ORIGINS`.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Example:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+DEV_ALLOWED_ORIGINS=http://localhost:3001,http://127.0.0.1:3001,http://192.168.1.150:3001
+```
 
-## Deploy on Vercel
+## Development
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Run the API:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+cd apps/api
+npm run dev
+```
+
+Run the UI:
+
+```bash
+cd apps/ui
+npm run dev
+```
+
+Open [http://localhost:3001](http://localhost:3001).

@@ -26,7 +26,7 @@
 }
 
 .primary:hover:not(:disabled) {
-  background: #141b2e;
+  background: var(--color-accent-hover);
 }
 
 .secondary {
@@ -36,7 +36,7 @@
 }
 
 .secondary:hover:not(:disabled) {
-  background: var(--color-surface-muted);
+  background: var(--color-highlight-soft);
 }
 
 .ghost {
@@ -45,7 +45,7 @@
 }
 
 .ghost:hover:not(:disabled) {
-  background: var(--color-surface-muted);
+  background: var(--color-accent-soft);
   color: var(--color-text);
 }
 

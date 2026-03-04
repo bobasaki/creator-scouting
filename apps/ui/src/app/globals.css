@@ -11,10 +11,18 @@ body {
 }
 
 body {
-  background: var(--color-bg);
+  background:
+    radial-gradient(circle at top left, var(--color-glow-yellow), transparent 28%),
+    radial-gradient(circle at top right, var(--color-glow-blue), transparent 36%),
+    var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
   line-height: 1.5;
+}
+
+::selection {
+  background: var(--color-highlight);
+  color: var(--color-highlight-ink);
 }
 
 a {

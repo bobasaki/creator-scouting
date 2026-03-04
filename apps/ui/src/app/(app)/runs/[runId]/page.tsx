@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import {
@@ -33,6 +34,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card, CardContent, CardHeader } from "@/components/ui/Card";
 import { useToast } from "@/components/ui/Toast";
+import { RUNS_UI_ENABLED } from "@/lib/features";
 import styles from "./RunDetailsPage.module.css";
 
 const formatter = new Intl.DateTimeFormat("en-US", {
@@ -99,7 +101,7 @@ export default function RunDetailsPage() {
   }
 
   useEffect(() => {
-    if (!runId) return;
+    if (!RUNS_UI_ENABLED || !runId) return;
     loadRun(runId);
   }, [runId]);
 
@@ -386,8 +388,8 @@ export default function RunDetailsPage() {
     decorated.sort((a, b) => {
       const aRow = a.row;
       const bRow = b.row;
-      let aVal: string | number | null = null;
-      let bVal: string | number | null = null;
+      let aVal: string | number | boolean | null = null;
+      let bVal: string | number | boolean | null = null;
 
       switch (sortKey) {
         case "channel":
@@ -477,6 +479,26 @@ export default function RunDetailsPage() {
       ? Math.min(1, completedItems / totalItems)
       : null;
 
+  if (!RUNS_UI_ENABLED) {
+    return (
+      <Container className={styles.page}>
+        <div className={styles.header}>
+          <h1>Internal runs</h1>
+          <p>
+            Run detail pages are restricted to internal debugging and ingestion workflows.
+          </p>
+        </div>
+        <Card>
+          <CardHeader>Catalog-first workflow</CardHeader>
+          <CardContent>
+            Use <Link href="/channels">/channels</Link> for normal scouting. Re-enable the
+            runs UI only for internal use with `NEXT_PUBLIC_ENABLE_RUNS_UI=true`.
+          </CardContent>
+        </Card>
+      </Container>
+    );
+  }
+
   return (
     <Container className={styles.page}>
       <div className={styles.header}>
@@ -492,8 +514,28 @@ export default function RunDetailsPage() {
           <div className={styles.metaRow}>
             {metaBadge("Region", run?.input?.region)}
             {metaBadge("Language", run?.input?.language)}
-            {metaBadge("Keywords", run?.input?.keywords?.length ?? 0)}
+            {metaBadge(
+              "Keyword",
+              run?.input?.keywords && run.input.keywords.length > 0
+                ? run.input.keywords.join(", ")
+                : "Any"
+            )}
+            {metaBadge(
+              "Exclude",
+              run?.input?.exclude_keywords && run.input.exclude_keywords.length > 0
+                ? run.input.exclude_keywords.join(", ")
+                : null
+            )}
             {metaBadge("Results", resultsCount)}
+            {metaBadge("Min views", run?.input?.min_views)}
+            {metaBadge("Max days", run?.input?.max_days_since_upload)}
+            {metaBadge("Min avg views", run?.input?.min_avg_views)}
+            {metaBadge(
+              "Min engagement",
+              run?.input?.min_engagement_rate != null
+                ? `${run?.input?.min_engagement_rate}%`
+                : null
+            )}
           </div>
         </div>
         <div className={styles.actions}>

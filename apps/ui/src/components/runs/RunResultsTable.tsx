@@ -42,6 +42,29 @@ function truncate(value: string, max = 80) {
   return `${value.slice(0, max - 1)}...`;
 }
 
+function formatEvidenceLine(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+
+  const obj = value as {
+    videoId?: unknown;
+    where?: unknown;
+    match?: unknown;
+  };
+
+  const videoId = typeof obj.videoId === "string" ? obj.videoId : "";
+  const where = typeof obj.where === "string" ? obj.where : "";
+  const match = typeof obj.match === "string" ? obj.match : "";
+  const formatted = [videoId, where, match].filter((part) => part.length > 0).join(":");
+  if (formatted.length > 0) return formatted;
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
 function getSponsorRatio(row: RunResult): number | null {
   if (typeof row.sponsorship_ratio === "number") return row.sponsorship_ratio;
   const enrichment = row.enrichment?.payload;
@@ -52,6 +75,60 @@ function getSponsorRatio(row: RunResult): number | null {
 function getScoreValue(value: number | null | undefined) {
   if (value === null || value === undefined || Number.isNaN(value)) return null;
   return value;
+}
+
+function getStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function getContactEmail(row: RunResult) {
+  const contact = row.scan_context?.contact_email;
+  if (!contact || typeof contact.email !== "string") return null;
+
+  const email = contact.email.trim();
+  if (email.length === 0) return null;
+
+  return {
+    email,
+    source: contact.source,
+    videoId: contact.video_id ?? null,
+    videoTitle: contact.video_title ?? null,
+  };
+}
+
+function getVideosScanned(row: RunResult) {
+  const videos = row.scan_context?.videos_scanned;
+  if (!Array.isArray(videos)) return [];
+
+  return videos
+    .map((video) => {
+      const videoId =
+        typeof video?.video_id === "string" ? video.video_id.trim() : "";
+      const title = typeof video?.title === "string" ? video.title.trim() : "";
+      const emailFound = video?.email_found === true;
+
+      if (videoId.length === 0 && title.length === 0) return null;
+
+      return {
+        videoId: videoId || null,
+        title: title || null,
+        emailFound,
+      };
+    })
+    .filter(
+      (
+        video
+      ): video is { videoId: string | null; title: string | null; emailFound: boolean } =>
+        Boolean(video)
+    );
+}
+
+function formatEmailSource(source: "bio" | "video_description") {
+  return source === "bio" ? "Bio" : "Video description";
 }
 
 export function RunResultsTable({
@@ -160,6 +237,30 @@ export function RunResultsTable({
           ) : (
             results.map((row, idx) => {
               const enrichment = row.enrichment?.payload ?? null;
+              const enrichmentStatus = row.enrichment?.status ?? "missing";
+              const enrichmentModel = row.enrichment?.model ?? null;
+              const enrichmentLanguage =
+                typeof enrichment?.languageDetected === "string"
+                  ? enrichment.languageDetected.trim()
+                  : "";
+              const enrichmentCategory =
+                typeof enrichment?.estimatedCategory === "string"
+                  ? enrichment.estimatedCategory.trim()
+                  : "";
+              const enrichmentType =
+                typeof enrichment?.estimatedType === "string"
+                  ? enrichment.estimatedType.trim()
+                  : "";
+              const enrichmentNiches = getStringArray(enrichment?.nicheLabels);
+              const enrichmentRedFlags = getStringArray(enrichment?.redFlags);
+              const enrichmentFitSummary =
+                typeof enrichment?.fitSummary === "string"
+                  ? enrichment.fitSummary.trim()
+                  : "";
+              const enrichmentBrandSafety =
+                typeof enrichment?.brandSafetyNotes === "string"
+                  ? enrichment.brandSafetyNotes.trim()
+                  : "";
               const rowId = row.metrics.channelId || String(idx);
               const whyText = getWhyText(row.why);
               const truncatedWhy = truncate(whyText, 80);
@@ -177,11 +278,33 @@ export function RunResultsTable({
                 getScoreValue(row.finalScoreFinal) ??
                 getScoreValue(row.finalScore);
               const sponsorRatio = getSponsorRatio(row);
-              const sponsorEvidence = enrichment?.sponsorship?.evidence ?? null;
+              const sponsorEvidenceRaw = enrichment?.sponsorship?.evidence ?? null;
+              const sponsorEvidence = Array.isArray(sponsorEvidenceRaw)
+                ? sponsorEvidenceRaw
+                    .map((line) => formatEvidenceLine(line))
+                    .filter((line) => line.trim().length > 0)
+                : [];
+              const contactEmail = getContactEmail(row);
+              const videosScanned = getVideosScanned(row);
+              const hasEnrichmentDetails =
+                Boolean(row.enrichment) &&
+                (enrichmentStatus !== "missing" ||
+                  Boolean(enrichmentModel) ||
+                  Boolean(enrichmentCategory) ||
+                  Boolean(enrichmentType) ||
+                  Boolean(enrichmentLanguage) ||
+                  enrichmentNiches.length > 0 ||
+                  Boolean(enrichmentFitSummary) ||
+                  Boolean(enrichmentBrandSafety) ||
+                  enrichmentRedFlags.length > 0);
+              const hasScanDetails =
+                Boolean(contactEmail) || videosScanned.length > 0;
               const hasDetails =
                 Boolean(row.score_breakdown) ||
-                (Array.isArray(sponsorEvidence) && sponsorEvidence.length > 0) ||
-                whyText.length > 0;
+                sponsorEvidence.length > 0 ||
+                whyText.length > 0 ||
+                hasEnrichmentDetails ||
+                hasScanDetails;
               const canToggle = hasDetails;
 
               return (
@@ -192,18 +315,32 @@ export function RunResultsTable({
                         case "channel":
                           return (
                             <td key={col.key} className={styles.td}>
-                              {row.metrics.channelUrl ? (
-                                <a
-                                  href={row.metrics.channelUrl}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className={styles.link}
-                                >
-                                  {row.metrics.channelName}
-                                </a>
-                              ) : (
-                                row.metrics.channelName
-                              )}
+                              <div className={styles.channelCell}>
+                                {row.metrics.channelUrl ? (
+                                  <a
+                                    href={row.metrics.channelUrl}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className={styles.link}
+                                  >
+                                    {row.metrics.channelName}
+                                  </a>
+                                ) : (
+                                  row.metrics.channelName
+                                )}
+                                {contactEmail ? (
+                                  <div className={styles.channelMeta}>
+                                    <a
+                                      href={`mailto:${contactEmail.email}`}
+                                      className={styles.emailLink}
+                                    >
+                                      {contactEmail.email}
+                                    </a>
+                                    {" · "}
+                                    {formatEmailSource(contactEmail.source)}
+                                  </div>
+                                ) : null}
+                              </div>
                             </td>
                           );
                         case "subs":
@@ -319,9 +456,7 @@ export function RunResultsTable({
                             </td>
                           );
                         case "evidence": {
-                          const evidenceCount = Array.isArray(sponsorEvidence)
-                            ? sponsorEvidence.length
-                            : 0;
+                          const evidenceCount = sponsorEvidence.length;
                           return (
                             <td key={col.key} className={styles.td}>
                               {evidenceCount > 0
@@ -376,8 +511,91 @@ export function RunResultsTable({
                             breakdown={row.score_breakdown}
                             scoringVersion={row.scoring_version}
                           />
-                          {Array.isArray(sponsorEvidence) &&
-                          sponsorEvidence.length > 0 ? (
+                          {hasEnrichmentDetails ? (
+                            <div className={styles.detailsSection}>
+                              <div className={styles.detailsTitle}>Enrichment</div>
+                              <div className={styles.detailsBody}>
+                                <div>
+                                  Status: {enrichmentStatus}
+                                  {enrichmentModel ? ` (${enrichmentModel})` : ""}
+                                </div>
+                                {enrichmentCategory ? (
+                                  <div>Category: {enrichmentCategory}</div>
+                                ) : null}
+                                {enrichmentType ? (
+                                  <div>Type: {enrichmentType}</div>
+                                ) : null}
+                                {enrichmentLanguage ? (
+                                  <div>Language: {enrichmentLanguage}</div>
+                                ) : null}
+                                {enrichmentNiches.length > 0 ? (
+                                  <div>Niches: {enrichmentNiches.join(", ")}</div>
+                                ) : null}
+                                {enrichmentFitSummary ? (
+                                  <div>Fit summary: {enrichmentFitSummary}</div>
+                                ) : null}
+                                {enrichmentBrandSafety ? (
+                                  <div>Brand safety: {enrichmentBrandSafety}</div>
+                                ) : null}
+                                {enrichmentRedFlags.length > 0 ? (
+                                  <div>Red flags: {enrichmentRedFlags.join(" | ")}</div>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
+                          {hasScanDetails ? (
+                            <div className={styles.detailsSection}>
+                              <div className={styles.detailsTitle}>Scan context</div>
+                              <div className={styles.detailsBody}>
+                                <div>
+                                  Email:{" "}
+                                  {contactEmail ? (
+                                    <a
+                                      href={`mailto:${contactEmail.email}`}
+                                      className={styles.emailLink}
+                                    >
+                                      {contactEmail.email}
+                                    </a>
+                                  ) : (
+                                    "-"
+                                  )}
+                                </div>
+                                {contactEmail ? (
+                                  <div>
+                                    Found in: {formatEmailSource(contactEmail.source)}
+                                    {contactEmail.source === "video_description" &&
+                                    (contactEmail.videoTitle || contactEmail.videoId)
+                                      ? ` (${
+                                          contactEmail.videoTitle ??
+                                          contactEmail.videoId
+                                        })`
+                                      : ""}
+                                  </div>
+                                ) : null}
+                                {videosScanned.length > 0 ? (
+                                  <div>Videos scanned: {videosScanned.length}</div>
+                                ) : null}
+                                {videosScanned.length > 0 ? (
+                                  <div className={styles.scanList}>
+                                    {videosScanned.map((video, videoIndex) => (
+                                      <div
+                                        key={`${rowId}-video-${video.videoId ?? videoIndex}`}
+                                        className={styles.scanItem}
+                                      >
+                                        <span>
+                                          {video.title ?? video.videoId ?? "Untitled video"}
+                                        </span>
+                                        {video.emailFound ? (
+                                          <span className={styles.badgePositive}>Email</span>
+                                        ) : null}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
+                          {sponsorEvidence.length > 0 ? (
                             <div className={styles.detailsSection}>
                               <div className={styles.detailsTitle}>Sponsor evidence</div>
                               <div className={styles.detailsBody}>

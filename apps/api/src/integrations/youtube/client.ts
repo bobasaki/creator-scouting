@@ -6,18 +6,19 @@ type YouTubeSearchChannelItem = {
 
 type YouTubeChannelListItem = {
   id: string;
-  snippet?: { title?: string };
+  snippet?: { title?: string; description?: string };
   statistics?: { subscriberCount?: string };
-};
-
-type YouTubeSearchVideoItem = {
-  id?: { videoId?: string };
+  contentDetails?: { relatedPlaylists?: { uploads?: string } };
 };
 
 type YouTubeVideoListItem = {
   id: string;
-  snippet?: { publishedAt?: string; title?: string; description?: string };
   statistics?: { viewCount?: string };
+};
+
+type YouTubePlaylistItem = {
+  contentDetails?: { videoId?: string; videoPublishedAt?: string };
+  snippet?: { title?: string; description?: string; publishedAt?: string };
 };
 
 type YouTubeErrorResponse = {
@@ -46,46 +47,100 @@ function buildUrl(base: string, params: Record<string, string | number | undefin
   return u.toString();
 }
 
+type CacheEntry = {
+  expiresAt: number;
+  value: unknown;
+};
+
+const youtubeResponseCache = new Map<string, CacheEntry>();
+const youtubeInflightRequests = new Map<string, Promise<unknown>>();
+
+function youtubeCacheConfig() {
+  const ttlMs = Math.max(0, Number(process.env.YOUTUBE_CACHE_TTL_MS ?? 120_000));
+  const maxEntries = Math.max(0, Number(process.env.YOUTUBE_CACHE_MAX_ENTRIES ?? 500));
+  return { ttlMs, maxEntries };
+}
+
+function pruneYoutubeCache(now: number, maxEntries: number) {
+  for (const [k, v] of youtubeResponseCache.entries()) {
+    if (v.expiresAt <= now) youtubeResponseCache.delete(k);
+  }
+  while (maxEntries > 0 && youtubeResponseCache.size > maxEntries) {
+    const oldest = youtubeResponseCache.keys().next().value as string | undefined;
+    if (!oldest) break;
+    youtubeResponseCache.delete(oldest);
+  }
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  const text = await res.text();
-  let data: any;
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { raw: text };
+  const { ttlMs, maxEntries } = youtubeCacheConfig();
+  const now = Date.now();
+
+  if (ttlMs > 0) {
+    const cached = youtubeResponseCache.get(url);
+    if (cached && cached.expiresAt > now) {
+      return cached.value as T;
+    }
+    if (cached) youtubeResponseCache.delete(url);
   }
 
-  if (!res.ok) {
-    const errData = data as YouTubeErrorResponse;
-    const reason = errData?.error?.errors?.[0]?.reason;
-    const rawMessage =
-      errData?.error?.message || reason || (typeof data?.raw === "string" ? data.raw : "");
-    const message = stripHtml(
-      rawMessage && String(rawMessage).trim().length > 0
-        ? String(rawMessage)
-        : `HTTP ${res.status}`
-    );
-    const lowerMessage = message.toLowerCase();
-    const isQuota =
-      reason === "quotaExceeded" ||
-      reason === "dailyLimitExceeded" ||
-      lowerMessage.includes("exceeded your quota");
+  const inflight = youtubeInflightRequests.get(url);
+  if (inflight) return (await inflight) as T;
 
-    if (isQuota) {
-      throw new ExternalApiError(429, "YOUTUBE_QUOTA_EXCEEDED", "YouTube API quota exceeded", {
+  const requestPromise = (async () => {
+    const res = await fetch(url);
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!res.ok) {
+      const errData = data as YouTubeErrorResponse;
+      const reason = errData?.error?.errors?.[0]?.reason;
+      const rawMessage =
+        errData?.error?.message || reason || (typeof (data as { raw?: string })?.raw === "string" ? (data as { raw?: string }).raw : "");
+      const message = stripHtml(
+        rawMessage && String(rawMessage).trim().length > 0
+          ? String(rawMessage)
+          : `HTTP ${res.status}`
+      );
+      const lowerMessage = message.toLowerCase();
+      const isQuota =
+        reason === "quotaExceeded" ||
+        reason === "dailyLimitExceeded" ||
+        lowerMessage.includes("exceeded your quota");
+
+      if (isQuota) {
+        throw new ExternalApiError(429, "YOUTUBE_QUOTA_EXCEEDED", "YouTube API quota exceeded", {
+          reason,
+          message
+        });
+      }
+
+      throw new ExternalApiError(502, "YOUTUBE_API_ERROR", "YouTube API request failed", {
         reason,
         message
       });
     }
 
-    throw new ExternalApiError(502, "YOUTUBE_API_ERROR", "YouTube API request failed", {
-      reason,
-      message
-    });
-  }
+    if (ttlMs > 0) {
+      const writeNow = Date.now();
+      pruneYoutubeCache(writeNow, maxEntries);
+      youtubeResponseCache.set(url, { expiresAt: writeNow + ttlMs, value: data });
+    }
 
-  return data as T;
+    return data as T;
+  })();
+
+  youtubeInflightRequests.set(url, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    youtubeInflightRequests.delete(url);
+  }
 }
 
 export async function searchChannelsByKeyword(
@@ -123,6 +178,8 @@ export async function getChannelDetails(
     channelName: string;
     channelUrl: string;
     subscriberCount: number;
+    description: string;
+    uploadsPlaylistId: string | null;
   }[]
 > {
   const key = requireApiKey();
@@ -137,12 +194,14 @@ export async function getChannelDetails(
     channelName: string;
     channelUrl: string;
     subscriberCount: number;
+    description: string;
+    uploadsPlaylistId: string | null;
   }[] = [];
 
   for (const chunk of chunks) {
     const url = buildUrl("https://www.googleapis.com/youtube/v3/channels", {
       key,
-      part: "snippet,statistics",
+      part: "snippet,statistics,contentDetails",
       id: chunk.join(",")
     });
 
@@ -156,7 +215,9 @@ export async function getChannelDetails(
         channelId,
         channelName,
         channelUrl: `https://youtube.com/channel/${channelId}`,
-        subscriberCount
+        subscriberCount,
+        description: it.snippet?.description ?? "",
+        uploadsPlaylistId: it.contentDetails?.relatedPlaylists?.uploads ?? null
       });
     }
   }
@@ -166,7 +227,8 @@ export async function getChannelDetails(
 
 export async function getRecentVideos(
   channelId: string,
-  maxVideos: number
+  maxVideos: number,
+  uploadsPlaylistId?: string
 ): Promise<{
   videoIds: string[];
   views: number[];
@@ -177,19 +239,47 @@ export async function getRecentVideos(
   const key = requireApiKey();
   const safeMax = Math.max(1, Math.min(maxVideos, 50));
 
-  const searchUrl = buildUrl("https://www.googleapis.com/youtube/v3/search", {
+  let uploadsId = uploadsPlaylistId;
+  if (!uploadsId) {
+    const channelUrl = buildUrl("https://www.googleapis.com/youtube/v3/channels", {
+      key,
+      part: "contentDetails",
+      id: channelId
+    });
+    const channelJson = await fetchJson<{ items?: YouTubeChannelListItem[] }>(channelUrl);
+    uploadsId = channelJson.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+  }
+
+  if (!uploadsId) {
+    return { videoIds: [], views: [], titles: [], descriptions: [], daysSinceLastUpload: 9999 };
+  }
+
+  const playlistUrl = buildUrl("https://www.googleapis.com/youtube/v3/playlistItems", {
     key,
-    part: "snippet",
-    channelId,
-    order: "date",
-    type: "video",
+    part: "contentDetails,snippet", 
+    playlistId: uploadsId,
     maxResults: safeMax
   });
 
-  const searchJson = await fetchJson<{ items?: YouTubeSearchVideoItem[] }>(searchUrl);
+  const playlistJson = await fetchJson<{ items?: YouTubePlaylistItem[] }>(playlistUrl);
+  const playlistItems = playlistJson.items ?? [];
 
-  const videoIds =
-    searchJson.items?.map((it) => it.id?.videoId).filter((id): id is string => Boolean(id)) ?? [];
+  const metaById = new Map<
+    string,
+    { title: string; description: string; publishedAt: string | null }
+  >();
+
+  const videoIds: string[] = [];
+  for (const it of playlistItems) {
+    const videoId = it.contentDetails?.videoId;
+    if (!videoId) continue;
+    videoIds.push(videoId);
+    metaById.set(videoId, {
+      title: it.snippet?.title ?? "",
+      description: it.snippet?.description ?? "",
+      publishedAt: it.contentDetails?.videoPublishedAt ?? it.snippet?.publishedAt ?? null
+    });
+  }
 
   if (videoIds.length === 0) {
     return { videoIds: [], views: [], titles: [], descriptions: [], daysSinceLastUpload: 9999 };
@@ -197,25 +287,22 @@ export async function getRecentVideos(
 
   const videosUrl = buildUrl("https://www.googleapis.com/youtube/v3/videos", {
     key,
-    part: "statistics,snippet",
+    part: "statistics",
     id: videoIds.join(",")
   });
 
   const videosJson = await fetchJson<{ items?: YouTubeVideoListItem[] }>(videosUrl);
 
-  // preserve order from videoIds
-  const orderMap = new Map<string, number>();
-  videoIds.forEach((id, idx) => orderMap.set(id, idx));
+  const viewsById = new Map<string, number>();
+  for (const it of videosJson.items ?? []) {
+    viewsById.set(it.id, Number(it.statistics?.viewCount ?? 0));
+  }
 
-  const items = (videosJson.items ?? []).slice().sort((a, b) => {
-    return (orderMap.get(a.id) ?? 0) - (orderMap.get(b.id) ?? 0);
-  });
+  const views = videoIds.map((id) => viewsById.get(id) ?? 0);
+  const titles = videoIds.map((id) => metaById.get(id)?.title ?? "");
+  const descriptions = videoIds.map((id) => metaById.get(id)?.description ?? "");
 
-  const views = items.map((it) => Number(it.statistics?.viewCount ?? 0));
-  const titles = items.map((it) => it.snippet?.title ?? "");
-  const descriptions = items.map((it) => it.snippet?.description ?? "");
-
-  const newestPublishedAt = items[0]?.snippet?.publishedAt;
+  const newestPublishedAt = metaById.get(videoIds[0])?.publishedAt ?? null;
   let daysSinceLastUpload = 9999;
   if (newestPublishedAt) {
     const published = new Date(newestPublishedAt).getTime();
@@ -226,52 +313,15 @@ export async function getRecentVideos(
   return { videoIds, views, titles, descriptions, daysSinceLastUpload };
 }
 
-// Move these types and function to top-level scope
-
-type YouTubeChannelSnippetItem = {
-  id: string;
-  snippet?: { description?: string };
-};
-
-type YouTubeSearchVideoSnippetItem = {
-  id?: { videoId?: string };
-  snippet?: { title?: string };
-};
-
 export async function getChannelText(
   channelId: string,
   maxTitles = 5
 ): Promise<{ description: string; recentTitles: string[] }> {
-  const key = requireApiKey();
   const safeMax = Math.max(1, Math.min(maxTitles, 10));
 
-  // 1) Fetch channel description
-  const channelUrl = buildUrl("https://www.googleapis.com/youtube/v3/channels", {
-    key,
-    part: "snippet",
-    id: channelId
-  });
+  const [detail] = await getChannelDetails([channelId]);
+  const recent = await getRecentVideos(channelId, safeMax, detail?.uploadsPlaylistId ?? undefined);
 
-  const channelJson = await fetchJson<{ items?: YouTubeChannelSnippetItem[] }>(channelUrl);
-  const description =
-    channelJson.items?.[0]?.snippet?.description?.trim() ?? "";
-
-  // 2) Fetch recent video titles
-  const searchUrl = buildUrl("https://www.googleapis.com/youtube/v3/search", {
-    key,
-    part: "snippet",
-    channelId,
-    order: "date",
-    type: "video",
-    maxResults: safeMax
-  });
-
-  const searchJson = await fetchJson<{ items?: YouTubeSearchVideoSnippetItem[] }>(searchUrl);
-
-  const recentTitles =
-    searchJson.items
-      ?.map((it) => it.snippet?.title?.trim())
-      .filter((t): t is string => Boolean(t)) ?? [];
-
-  return { description, recentTitles };
+  const recentTitles = recent.titles.map((t) => t.trim()).filter(Boolean).slice(0, safeMax);
+  return { description: detail?.description?.trim() ?? "", recentTitles };
 }

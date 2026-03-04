@@ -8,6 +8,8 @@ export type EnrichmentPayload = {
   model?: string;
   status: EnrichmentStatus;
 
+  estimatedCategory?: string;
+  estimatedType?: string;
   nicheLabels?: string[];
   languageDetected?: string;
   fitSummary?: string;
@@ -16,6 +18,14 @@ export type EnrichmentPayload = {
 
   sponsorship?: any;
   raw?: any;
+};
+
+export type CachedYouTubeContext = {
+  description: string;
+  recentTitles: string[];
+  videoIds: string[];
+  titles: string[];
+  descriptions: string[];
 };
 
 export async function markPending(args: {
@@ -42,7 +52,7 @@ export async function markPending(args: {
       fitSummary: null,
       brandSafetyNotes: null,
       redFlags: Prisma.DbNull,
-      raw: Prisma.DbNull
+      // Keep existing raw payload (e.g. cached YouTube context) for reuse in enrichment.
     }
   });
 
@@ -121,22 +131,53 @@ export async function saveFailure(params: {
   channelId: string;
   model?: string;
   error: { message: string; code?: string };
+  youtubeContext?: CachedYouTubeContext | null;
 }) {
-  const { runId, channelId, model, error } = params;
+  const { runId, channelId, model, error, youtubeContext } = params;
+
+  const rawPayload: Prisma.InputJsonObject = youtubeContext
+    ? { error, youtubeContext }
+    : { error };
 
   return prisma.runResultEnrichment.upsert({
     where: { runId_channelId: { runId, channelId } },
     update: {
       status: "failed",
       model: model ?? null,
-      raw: { error }
+      raw: rawPayload
     },
     create: {
       runId,
       channelId,
       status: "failed",
       model: model ?? null,
-      raw: { error }
+      raw: rawPayload
+    }
+  });
+}
+
+export async function saveCachedContext(params: {
+  runId: string;
+  channelId: string;
+  context: CachedYouTubeContext;
+}) {
+  const { runId, channelId, context } = params;
+
+  return prisma.runResultEnrichment.upsert({
+    where: { runId_channelId: { runId, channelId } },
+    update: {
+      raw: {
+        youtubeContext: context
+      }
+    },
+    create: {
+      runId,
+      channelId,
+      status: "cached",
+      model: null,
+      raw: {
+        youtubeContext: context
+      }
     }
   });
 }

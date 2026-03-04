@@ -8,7 +8,7 @@ export type ScoreBreakdownPanelProps = {
   scoringVersion?: string;
 };
 
-function renderComponents(components: Record<string, number> | undefined) {
+function renderComponents(components: Record<string, number | undefined> | undefined) {
   if (!components) return null;
   const entries = Object.entries(components);
   if (entries.length === 0) return null;
@@ -16,7 +16,7 @@ function renderComponents(components: Record<string, number> | undefined) {
     <div className={styles.components}>
       {entries.map(([key, value]) => (
         <div key={key}>
-          {key}: {Number.isFinite(value) ? value.toFixed(2) : String(value)}
+          {key}: {typeof value === "number" ? value.toFixed(2) : String(value)}
         </div>
       ))}
     </div>

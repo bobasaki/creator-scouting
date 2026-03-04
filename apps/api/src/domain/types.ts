@@ -4,14 +4,18 @@ export interface ChannelMetrics {
   channelUrl: string;
 
   subscriberCount: number;
+  minViewsLastN: number;
   avgViewsLastN: number;
+  engagementRateLastN: number;
   daysSinceLastUpload: number;
 
   recentViews: number[]; // used for consistency
 }
 
 export interface FilterParams {
+  minViews?: number;
   minAvgViews?: number;
+  minEngagementRate?: number;
   maxDaysSinceUpload?: number;
   minSubscribers?: number;
 }

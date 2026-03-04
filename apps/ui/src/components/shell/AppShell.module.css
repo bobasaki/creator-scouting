@@ -1,10 +1,40 @@
 .shell {
   min-height: 100vh;
   background: var(--color-bg);
+  position: relative;
+  overflow: hidden;
+}
+
+.shell::before,
+.shell::after {
+  content: "";
+  position: fixed;
+  border-radius: 999px;
+  pointer-events: none;
+  filter: blur(10px);
+  z-index: 0;
+}
+
+.shell::before {
+  width: 320px;
+  height: 320px;
+  top: -120px;
+  right: -110px;
+  background: var(--color-glow-blue);
+}
+
+.shell::after {
+  width: 260px;
+  height: 260px;
+  bottom: 4vh;
+  right: 10vw;
+  background: var(--color-glow-yellow);
 }
 
 .shellInner {
   min-height: 100vh;
+  position: relative;
+  z-index: 1;
 }
 
 @media (min-width: 900px) {
@@ -18,30 +48,63 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-3);
 }
 
 .topBar {
   position: sticky;
-  top: 0;
+  top: var(--space-3);
   z-index: 10;
+  display: grid;
+  gap: var(--space-4);
+  grid-template-columns: minmax(0, 1.3fr) minmax(260px, 360px);
+  padding: var(--space-4);
+  background: color-mix(in srgb, var(--color-surface) 86%, var(--color-highlight) 14%);
+  border: 1px solid var(--color-border);
+  border-radius: calc(var(--radius-lg) + 2px);
+  box-shadow: var(--shadow-md);
+}
+
+.topBarLead {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: flex-start;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  background: var(--color-surface);
-  border-bottom: 1px solid var(--color-border);
+  min-width: 0;
+}
+
+.topBarCopy {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.topEyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-accent);
+}
+
+.topTitleRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .menuButton {
   border: 1px solid var(--color-border);
-  background: var(--color-surface);
-  color: var(--color-text);
+  background: var(--color-highlight);
+  color: var(--color-highlight-ink);
+  min-height: 40px;
   padding: 6px 12px;
-  border-radius: var(--radius-sm);
+  border-radius: 999px;
   cursor: pointer;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
+  box-shadow: var(--shadow-sm);
 }
 
 @media (min-width: 900px) {
@@ -51,9 +114,54 @@
 }
 
 .topTitle {
+  font-size: clamp(24px, 2.8vw, 42px);
+  line-height: 0.92;
+  letter-spacing: -0.04em;
+  font-weight: 800;
+  color: var(--color-text);
+}
+
+.sectionBadge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.topCaption {
+  margin: 0;
+  max-width: 680px;
+  font-size: 14px;
+  color: var(--color-muted);
+}
+
+.connectionCard {
+  display: grid;
+  align-content: space-between;
+  gap: var(--space-2);
+  min-height: 100%;
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--color-code-bg);
+  color: var(--color-code-text);
+}
+
+.connectionLabel {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--color-highlight);
+}
+
+.connectionValue {
   font-size: 14px;
   font-weight: 700;
-  color: var(--color-text);
 }
 
 .connection {
@@ -61,18 +169,18 @@
   align-items: center;
   gap: var(--space-2);
   font-size: 12px;
-  color: var(--color-muted);
+  color: color-mix(in srgb, var(--color-code-text) 82%, transparent);
 }
 
 .healthDot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--color-border-strong);
+  background: color-mix(in srgb, var(--color-code-text) 28%, transparent);
 }
 
 .healthOk {
-  background: var(--color-success);
+  background: var(--color-highlight);
 }
 
 .healthError {
@@ -82,4 +190,14 @@
 .main {
   flex: 1;
   padding-bottom: var(--space-8);
+}
+
+@media (max-width: 980px) {
+  .content {
+    padding: var(--space-3) var(--space-3) var(--space-5);
+  }
+
+  .topBar {
+    grid-template-columns: 1fr;
+  }
 }
